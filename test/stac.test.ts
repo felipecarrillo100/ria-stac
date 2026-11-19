@@ -1,8 +1,9 @@
+import {fromText} from "ogc-cql2/parse";
 import {afterEach, describe, expect, it, vi} from "vitest";
 import {
     assetBands, bestPerPeriod, coverArea, dedupeItems, emptyProfile, evaluateCql2, groupItems, itemBandNames,
     itemsCovering, normaliseDatetime, parseCapabilities, planetaryComputerSigner, planSearch, resolveAsset, sortItems,
-    StacClient, toBandInputs, toCql2Text, type StacItemJson,
+    StacClient, StacError, splitFilter, formatsFilter, toBandInputs, toCql2Text, type StacItemJson,
 } from "../src/stac/index.js";
 
 // ------------------------------------------------------------------------------------------------ fixtures
@@ -31,6 +32,10 @@ function mockServer(options: {
     items: StacItemJson[];
     pageSize?: number;
     mergePaging?: boolean;
+    /** The JSON Schema served at /collections/s2/queryables (404 without). */
+    queryables?: Record<string, unknown>;
+    /** Answer 400 to a filter whose JSON matches. */
+    refuses?: RegExp;
 }) {
     const base = "https://stac.test/v1";
     const calls: { method: string; url: string; body?: Record<string, unknown> }[] = [];
@@ -45,14 +50,22 @@ function mockServer(options: {
             return json(200, {type: "Catalog", id: "test", stac_version: "1.1.0", conformsTo: options.conformsTo ?? [],
                 links: [{rel: "search", href: `${base}/search`, type: "application/geo+json"}, {rel: "data", href: `${base}/collections`}]});
         }
+        if (url.pathname === "/v1/collections/s2/queryables" && options.queryables) return json(200, options.queryables);
         if (url.pathname === "/v1/search") {
             if (method === "POST" && options.post405) return json(405, {detail: "Method Not Allowed"});
-            const params = body ?? Object.fromEntries(url.searchParams.entries());
+            const params: Record<string, unknown> = {...(body ?? Object.fromEntries(url.searchParams.entries()))};
+            // CQL2-text is read as a CQL2 server would; a GET filter in JSON arrives as a string too.
+            if (typeof params.filter === "string") {
+                params.filter = params["filter-lang"] === "cql2-text" ? fromText(params.filter) : JSON.parse(params.filter);
+            }
+            if (params.filter !== undefined && options.refuses?.test(JSON.stringify(params.filter))) {
+                return json(400, {code: "InvalidFilter", description: "Operator not supported"});
+            }
             const limit = Number(params.limit ?? 10);
             if (options.maxLimit && limit > options.maxLimit) return json(400, {detail: `limit must be <= ${options.maxLimit}`});
             let matches = options.items;
             const cc = (i: StacItemJson) => Number(i.properties["eo:cloud_cover"]);
-            const filter = typeof params.filter === "string" ? undefined : params.filter as {op: string; args: [unknown, number]} | undefined;
+            const filter = params.filter as {op: string; args: [unknown, number]} | undefined;
             if (filter && !options.ignoresFilter) matches = matches.filter((i) => evaluateCql2(filter, i));
             const query = typeof params.query === "string" ? JSON.parse(params.query) : params.query as Record<string, {lt?: number}> | undefined;
             if (query && !options.ignoresQuery && query["eo:cloud_cover"]?.lt !== undefined) matches = matches.filter((i) => cc(i) < query["eo:cloud_cover"].lt!);
@@ -73,6 +86,126 @@ function mockServer(options: {
 }
 
 afterEach(() => vi.unstubAllGlobals());
+
+// ------------------------------------------------------------------------------------------------ CQL2 on the server
+
+describe("CQL2 on the server, by the classes it declares", () => {
+    const items = [
+        item("S2A_1", {"eo:cloud_cover": 5, platform: "sentinel-2a"}),
+        item("S2B_2", {"eo:cloud_cover": 8, platform: "sentinel-2b"}),
+        item("L8_3", {"eo:cloud_cover": 3, platform: "landsat-8"}),
+        item("S2A_4", {"eo:cloud_cover": 60, platform: "sentinel-2a"}),
+    ];
+    const ids = (found: StacItemJson[]) => found.map((i) => i.id).sort();
+    const where = {"eo:cloud_cover": {lt: 20}, platform: {like: "sentinel-%"}};
+    const basic = [C("item-search"), C("item-search#filter"), CQL2("basic-cql2"), CQL2("cql2-json"), CQL2("cql2-text")];
+
+    it("maps declared classes, older names included, to CQL2 1.0 URIs", () => {
+        // Digital Earth Australia and Africa (datacube-explorer) declare spatial-operators.
+        const dea = parseCapabilities({conformsTo: [C("item-search#filter"), CQL2("basic-cql2"), CQL2("advanced-comparison-operators"), CQL2("spatial-operators"), CQL2("cql2-json")]});
+        expect(dea.filter!.conformance).toEqual([CQL2("basic-cql2"), CQL2("advanced-comparison-operators"), CQL2("basic-spatial-functions"),
+            CQL2("basic-spatial-functions-plus"), CQL2("spatial-functions")]);
+        expect(parseCapabilities({conformsTo: basic}).filter!.conformance).toEqual([CQL2("basic-cql2")]);
+    });
+
+    it("basic CQL2 only (Planetary Computer, Copernicus): the server gets the comparison, the client the LIKE", async () => {
+        const {calls} = mockServer({conformsTo: basic, items});
+        const client = await StacClient.connect("https://stac.test/v1");
+        const search = client.search({collections: ["s2"], where});
+        expect(ids(await search.collect())).toEqual(["S2A_1", "S2B_2"]);
+        const sent = calls.find((c) => c.url.endsWith("/search"))!.body!;
+        expect(sent.filter).toEqual({op: "<", args: [{property: "eo:cloud_cover"}, 20]});
+        expect(search.plan).toMatchObject({filterEncoding: "cql2-json", serverFilter: sent.filter,
+            clientFilter: {op: "like", args: [{property: "platform"}, "sentinel-%"]}});
+        expect(search.plan.degradations).toContainEqual(expect.objectContaining({kind: "filter-split", client: "platform LIKE 'sentinel-%'",
+            reason: expect.stringMatching(/advanced-comparison-operators/)}));
+        expect(client.profile.filterApplied).toBe("yes");   // the check covers only the part sent
+    });
+
+    it("advanced comparison (Digital Earth Australia): the whole filter goes to the server", async () => {
+        const {calls} = mockServer({conformsTo: [...basic, CQL2("advanced-comparison-operators")], items});
+        const client = await StacClient.connect("https://stac.test/v1");
+        const search = client.search({collections: ["s2"], where});
+        expect(ids(await search.collect())).toEqual(["S2A_1", "S2B_2"]);
+        expect(JSON.stringify(calls.find((c) => c.url.endsWith("/search"))!.body!.filter)).toMatch(/like/);
+        expect(search.plan.clientFilter).toBeUndefined();
+        expect(search.plan.degradations.map((d) => d.kind)).not.toContain("filter-split");
+    });
+
+    it("CQL2-text only (DLR): the filter is written as text, and the server reads it", async () => {
+        const {calls} = mockServer({conformsTo: [C("item-search"), C("item-search#filter"), CQL2("basic-cql2"), CQL2("advanced-comparison-operators"), CQL2("cql2-text")], items});
+        const client = await StacClient.connect("https://stac.test/v1");
+        const search = client.search({collections: ["s2"], where});
+        expect(ids(await search.collect())).toEqual(["S2A_1", "S2B_2"]);
+        expect(search.plan.filterEncoding).toBe("cql2-text");
+        expect(calls.find((c) => c.url.endsWith("/search"))!.body!.filter).toBe("(eo:cloud_cover < 20) AND (platform LIKE 'sentinel-%')");
+    });
+
+    it("an asset-format filter stays on the client, beside a server-side comparison", async () => {
+        const cog = {data: {href: "https://x.test/a.tif", type: "image/tiff; application=geotiff; profile=cloud-optimized"}};
+        const zip = {data: {href: "https://x.test/a.zip", type: "application/x.ascii-xyz+zip"}};
+        const mixed = [item("cog", {"eo:cloud_cover": 1}, undefined, cog), item("zip", {"eo:cloud_cover": 1}, undefined, zip),
+            item("cloudy", {"eo:cloud_cover": 90}, undefined, cog)];
+        mockServer({conformsTo: basic, items: mixed});
+        const client = await StacClient.connect("https://stac.test/v1");
+        const search = client.search({collections: ["s2"], where: {"eo:cloud_cover": {lt: 20}}, filter: formatsFilter(["COG"])});
+        expect(ids(await search.collect())).toEqual(["cog"]);
+        expect(search.plan.serverFilter).toEqual({op: "<", args: [{property: "eo:cloud_cover"}, 20]});
+        expect(search.plan.clientFilter).toEqual(formatsFilter(["COG"]));
+    });
+
+    it("queryables: a property the schema forbids stays on the client; additional properties may go", async () => {
+        const strict = {type: "object", properties: {"eo:cloud_cover": {type: "number"}}, additionalProperties: false};
+        mockServer({conformsTo: [...basic, CQL2("advanced-comparison-operators")], items, queryables: strict});
+        let client = await StacClient.connect("https://stac.test/v1");
+        let search = client.search({collections: ["s2"], where});
+        expect(ids(await search.collect())).toEqual(["S2A_1", "S2B_2"]);
+        expect(search.plan.clientFilter).toEqual({op: "like", args: [{property: "platform"}, "sentinel-%"]});
+        expect(search.plan.degradations).toContainEqual(expect.objectContaining({kind: "filter-split", reason: expect.stringMatching(/platform/)}));
+        mockServer({conformsTo: [...basic, CQL2("advanced-comparison-operators")], items, queryables: {...strict, additionalProperties: true}});
+        client = await StacClient.connect("https://stac.test/v1");
+        search = client.search({collections: ["s2"], where});
+        await search.collect();
+        expect(search.plan.clientFilter).toBeUndefined();
+    });
+
+    it("a filter the server refuses with 400 is tested on the client instead", async () => {
+        const {calls} = mockServer({conformsTo: [...basic, CQL2("advanced-comparison-operators")], items, refuses: /like/});
+        const client = await StacClient.connect("https://stac.test/v1");
+        const search = client.search({collections: ["s2"], where});
+        expect(ids(await search.collect())).toEqual(["S2A_1", "S2B_2"]);
+        expect(search.plan.degradations).toContainEqual({kind: "filter-refused", encoding: "cql2-json", message: "Operator not supported"});
+        // CQL2-JSON refused, then CQL2-text (also refused), then the client.
+        expect(calls.filter((c) => c.url.endsWith("/search")).length).toBeGreaterThanOrEqual(3);
+        expect(search.plan.filterEncoding).toBe("client");
+    });
+
+    it("a success that is not JSON is an error that says so: an HTML error page, a bot check's empty 202", async () => {
+        const landing = {type: "Catalog", id: "t", stac_version: "1.1.0", conformsTo: basic,
+            links: [{rel: "search", href: "https://waf.test/v1/search"}, {rel: "data", href: "https://waf.test/v1/collections"}]};
+        vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+            const url = String(input);
+            if (/\/v1\/?$/.test(url)) return new Response(JSON.stringify(landing), {status: 200});
+            if (url.endsWith("/collections")) return new Response("<!DOCTYPE html><title>Server error</title>", {status: 200, headers: {"Content-Type": "text/html"}});
+            return new Response("", {status: 202, headers: {"x-amzn-waf-action": "challenge"}});   // the search
+        }));
+        const client = await StacClient.connect("https://waf.test/v1");
+        await expect(client.listCollections()).rejects.toThrow(/HTTP 200 .* is not JSON \(it starts with "<!DOCTYPE html>/);
+        const error = await client.search({collections: ["s2"]}).collect().catch((e: StacError) => e);
+        expect(error).toBeInstanceOf(StacError);
+        expect(error).toMatchObject({status: 202, message: expect.stringMatching(/not JSON \(it starts with an empty body\)/)});
+    });
+
+    it("splitFilter keeps the parts a server can take, and says why the others stay", () => {
+        const filter = {op: "and", args: [{op: "<", args: [{property: "eo:cloud_cover"}, 20]},
+            {op: "t_intersects", args: [{property: "datetime"}, {interval: ["2024-01-01T00:00:00Z", "2024-12-31T23:59:59Z"]}]}]};
+        const split = splitFilter(filter, [CQL2("basic-cql2")]);
+        expect(split.server).toEqual(filter.args[0]);
+        expect(split.client).toEqual(filter.args[1]);
+        expect(split.reason).toMatch(/temporal-functions/);
+        expect(splitFilter(filter, [CQL2("basic-cql2"), CQL2("temporal-functions")]).client).toBeUndefined();
+    });
+});
 
 // ------------------------------------------------------------------------------------------------ tests
 
@@ -135,7 +268,11 @@ describe("capabilities and requests", () => {
         const after = {op: ">", args: [{property: "datetime"}, {timestamp: "2024-06-01T00:00:00Z"}]};
         expect(evaluateCql2(after, item("late", {datetime: "2024-07-01T10:00:00Z"}))).toBe(true);
         expect(evaluateCql2(after, item("early", {datetime: "2024-05-01T10:00:00Z"}))).toBe(false);
-        expect(evaluateCql2({op: "between", args: [{property: "datetime"}, {date: "2024-06-01"}, {date: "2024-08-01"}]}, item("x", {}))).toBe(true);
+        const july = {op: "t_intersects", args: [{property: "datetime"}, {interval: ["2024-06-01T00:00:00Z", "2024-08-01T00:00:00Z"]}]};
+        expect(evaluateCql2(july, item("late", {datetime: "2024-07-01T10:00:00Z"}))).toBe(true);
+        expect(evaluateCql2(july, item("early", {datetime: "2024-05-01T10:00:00Z"}))).toBe(false);
+        // CQL2 compares numbers with BETWEEN, not instants: ogc-cql2 refuses it, as a CQL2 server would.
+        expect(() => evaluateCql2({op: "between", args: [{property: "datetime"}, {date: "2024-06-01"}, {date: "2024-08-01"}]}, item("x", {}))).toThrow(/BETWEEN/);
         expect(evaluateCql2({op: "s_intersects", args: [{property: "geometry"}, {type: "Polygon", coordinates: [[[5, 5], [20, 5], [20, 20], [5, 5]]]}]},
             item("a", {}))).toBe(true);
     });

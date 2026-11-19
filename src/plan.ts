@@ -3,6 +3,7 @@
  * server applies, what runs in the browser, and every degradation. No network here.
  */
 import type {StacCapabilities, ServerProfile} from "./capabilities.js";
+import {validate} from "ogc-cql2/validate";
 import {evaluateCql2, toCql2Text, whereToCql2, whereToQuery, type Cql2Json, type WhereComparison} from "./cql2.js";
 import {bboxOf, intersectsArea, isBbox} from "./geometry.js";
 import type {Bbox, GeoJsonArea, StacItemJson} from "./json.js";
@@ -175,6 +176,25 @@ export type Degradation =
         maxScanned: number;
     }
     | {
+        /**
+         * The filter is split: the server applies the parts it supports (see {@link SearchPlan.serverFilter}),
+         * the client the others ({@link SearchPlan.clientFilter}), on the items returned.
+         */
+        kind: "filter-split";
+        /** The part tested on the client, as CQL2-text (or CQL2-JSON when it has no text form). */
+        client: string;
+        /** Why: the CQL2 classes or properties the server does not declare. */
+        reason: string;
+    }
+    | {
+        /** The server answered the filter with an error (400): it is tested on the client instead. */
+        kind: "filter-refused";
+        /** The encoding refused. */
+        encoding: FilterEncoding;
+        /** The server's message, when it gave one. */
+        message: string;
+    }
+    | {
         /** The datetime was rewritten. */
         kind: "datetime-normalised";
         /** The datetime as given (arrays as JSON). */
@@ -214,6 +234,13 @@ export interface SearchPlan {
     serverApplies: string[];
     /** Parts the client applies to the returned items (they cost scanned items, bounded by maxScanned). */
     clientApplies: string[];
+    /** The CQL2 filter the server is sent (with `filterEncoding` `"cql2-json"` or `"cql2-text"`). */
+    serverFilter?: Cql2Json;
+    /**
+     * The CQL2 filter tested on the client, on the items returned: the whole filter when the server applies none
+     * of it, the parts it does not support when the filter is split (`filter-split`), else undefined.
+     */
+    clientFilter?: Cql2Json;
     /** Differences between the request and what is sent, in the order they were found. */
     degradations: Degradation[];
     /** The same request as shell and JavaScript code, for display and debugging. */
@@ -223,6 +250,33 @@ export interface SearchPlan {
         /** A JavaScript expression with `fetch` that resolves to the response JSON. */
         fetch: string;
     };
+}
+
+/**
+ * A collection's queryables as served (`/collections/{id}/queryables`, a JSON Schema): what {@link splitFilter}
+ * checks a filter against.
+ *
+ * @category Search
+ */
+export interface QueryablesSchema {
+    /** The properties a filter may name, each a JSON Schema (`type`, `format`, ...). */
+    properties?: Record<string, object>;
+    /** `false` when a filter may name no other property; servers usually allow others (`true` or absent). */
+    additionalProperties?: unknown;
+}
+
+/**
+ * A filter split by {@link splitFilter}: the parts a server can apply and the parts the client must.
+ *
+ * @category Search
+ */
+export interface FilterSplit {
+    /** The parts the server is sent (ANDed), or undefined when it can apply none. */
+    server?: Cql2Json;
+    /** The parts the client tests (ANDed), or undefined when the server applies all. */
+    client?: Cql2Json;
+    /** Why parts stay on the client (the CQL2 classes or properties missing), empty when none do. */
+    reason: string;
 }
 
 /** Options of {@link planSearch}.
@@ -235,6 +289,12 @@ export interface PlanOptions {
     pageSize?: number;
     /** Encodings not to use (the search falls back through the list after verification). */
     exclude?: FilterEncoding[];
+    /**
+     * The collection's queryables (its `/queryables` JSON Schema), when known: a filter part using a property it
+     * does not list stays on the client when the schema has `additionalProperties: false`, and a part comparing a
+     * property with a value of another type (a string with a number) stays on the client always.
+     */
+    queryables?: QueryablesSchema;
 }
 
 // ------------------------------------------------------------------------------------------------ datetime
@@ -386,6 +446,7 @@ export function planSearch(
     }
 
     // Filter encoding: CQL2-JSON (POST), CQL2-text (GET), the Query extension, else client-side.
+    let serverFilter: Cql2Json | undefined, planClientFilter: Cql2Json | undefined, noCql2: string | undefined;
     const hasPredicates = request.where !== undefined || request.filter !== undefined;
     let encoding: FilterEncoding = "none";
     if (hasPredicates || request.query) {
@@ -405,28 +466,35 @@ export function planSearch(
             if (!advanced && JSON.stringify(expr) !== JSON.stringify(requestFilter(request, true))) {
                 degradations.push({kind: "operators-rewritten", reason: "in/between as basic comparisons (no advanced-comparison conformance)"});
             }
-            if (encoding === "cql2-json") {
-                body.filter = expr;
-                body["filter-lang"] = "cql2-json";
+            // Each part of the top-level AND goes to the server when its CQL2 classes and properties are the
+            // server's (and, in text, when it can be written); the others are tested on the client.
+            const split = splitFilter(expr, f!.conformance, options.queryables, encoding === "cql2-text");
+            if (split.server === undefined) {
+                // Nothing the server can apply: the next encoding.
+                encoding = caps.query && whereQuery && !exclude.has("query") ? "query" : "client";
+                noCql2 = `the server's CQL2 cannot apply it (${split.reason})`;
             } else {
-                try {
-                    body.filter = toCql2Text(expr);
-                    body["filter-lang"] = "cql2-text";
-                } catch {
-                    encoding = caps.query && whereQuery ? "query" : "client";
+                body.filter = encoding === "cql2-json" ? split.server : toCql2Text(split.server);
+                body["filter-lang"] = encoding;
+                serverFilter = split.server;
+                serverApplies.push(`filter (${encoding})`);
+                if (split.client !== undefined) {
+                    planClientFilter = split.client;
+                    clientApplies.push("where/filter");
+                    degradations.push({kind: "filter-split", client: textOf(split.client), reason: split.reason});
                 }
             }
-            if (body.filter !== undefined) serverApplies.push(`filter (${encoding})`);
         }
         if (encoding === "query") {
             body.query = {...(whereQuery ?? {}), ...(request.query ?? {})};
             serverApplies.push("query extension");
-            if (hasPredicates) degradations.push({kind: "filter-via-query", reason: f ? "CQL2 found ignored by this server" : "no CQL2 support"});
+            if (hasPredicates) degradations.push({kind: "filter-via-query", reason: noCql2 ?? (f ? "CQL2 found ignored by this server" : "no CQL2 support")});
         }
         if (encoding === "client") {
             if (hasPredicates) {
-                clientApplies.push("where/filter");
-                degradations.push({kind: "filter-client-side", reason: "the server applies no usable filter", maxScanned: request.maxScanned ?? 2000});
+                planClientFilter = requestFilter(request);
+                if (!clientApplies.includes("where/filter")) clientApplies.push("where/filter");
+                degradations.push({kind: "filter-client-side", reason: noCql2 ?? "the server applies no usable filter", maxScanned: request.maxScanned ?? 2000});
             }
             if (request.query) {
                 // A raw Query object cannot be evaluated on the client: send it and hope, as given.
@@ -481,7 +549,49 @@ export function planSearch(
     const http: HttpRequestSpec = method === "POST"
         ? {method, url: searchUrl, headers: {"Content-Type": "application/json", Accept: "application/geo+json"}, body}
         : {method, url: withQuery(searchUrl, getParams(body)), headers: {Accept: "application/geo+json"}};
-    return {request, http, filterEncoding: encoding, serverApplies, clientApplies, degradations, code: codeOf(http)};
+    return {request, http, filterEncoding: encoding, serverApplies, clientApplies,
+        ...(serverFilter !== undefined ? {serverFilter} : {}), ...(planClientFilter !== undefined ? {clientFilter: planClientFilter} : {}),
+        degradations, code: codeOf(http)};
+}
+
+/** CQL2-text of a filter for messages, else its JSON. */
+function textOf(e: Cql2Json): string {
+    try { return toCql2Text(e); } catch { return JSON.stringify(e); }
+}
+
+/** The parts of a top-level AND (the filter itself when it is not one). */
+function conjuncts(e: Cql2Json): Cql2Json[] {
+    return typeof e === "object" && e.op.toLowerCase() === "and" ? e.args.flatMap((a) => conjuncts(a as Cql2Json)) : [e];
+}
+
+const andOf = (parts: Cql2Json[]): Cql2Json | undefined => (parts.length === 0 ? undefined : parts.length === 1 ? parts[0] : {op: "and", args: parts});
+
+/**
+ * Splits a filter into what a server can apply and what the client must: each part of its top-level AND is
+ * checked with `ogc-cql2`'s `validate` against the server's CQL2 classes and the collection's queryables.
+ *
+ * @param e The filter.
+ * @param conformance The server's CQL2 classes (`StacCapabilities.filter.conformance`).
+ * @param queryables The collection's queryables schema, when known.
+ * @param text Whether the server part must be writable as CQL2-text.
+ * @returns The server part, the client part (either undefined when empty) and why parts stay on the client.
+ *
+ * @category Search
+ */
+export function splitFilter(e: Cql2Json, conformance: readonly string[], queryables?: QueryablesSchema, text = false): FilterSplit {
+    const server: Cql2Json[] = [], client: Cql2Json[] = [], reasons = new Set<string>();
+    const strict = queryables?.additionalProperties === false;
+    for (const part of conjuncts(e)) {
+        const result = validate(part, {conformance, ...(queryables?.properties ? {queryables: queryables.properties} : {})});
+        // Properties the queryables do not list are fine unless the schema forbids others.
+        const problems = result.valid ? [] : result.problems.filter((p) => strict || p.code !== "unknown-property");
+        let why = problems.map((p) => (p.conformance ? `needs ${p.conformance.replace(/^.*\/conf\//, "")}` : p.message))[0];
+        if (!why && text) {
+            try { toCql2Text(part); } catch { why = "has no CQL2-text form"; }
+        }
+        if (why) { client.push(part); reasons.add(why); } else server.push(part);
+    }
+    return {server: andOf(server), client: andOf(client), reason: [...reasons].join("; ")};
 }
 
 /**

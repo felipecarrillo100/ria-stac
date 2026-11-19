@@ -3,6 +3,7 @@
  * (the server profile). Conformance URIs are matched by pattern: their version segments are inconsistent across
  * extensions and releases (v1.0.0, v1.0.0-rc.2, v0.3.0, ...).
  */
+import {CONFORMANCE} from "ogc-cql2";
 import type {StacCatalogJson} from "./json.js";
 
 /**
@@ -40,6 +41,13 @@ export interface StacCapabilities {
         advancedComparison: boolean;
         /** Array operators (`a_contains` and others). */
         arrays: boolean;
+        /**
+         * The CQL2 filter classes declared, as the URIs of CQL2 1.0 (`CONFORMANCE` of `ogc-cql2`), for its
+         * `validate`: what a filter may use to be sent to this server. Basic CQL2 is always there. Older names
+         * are read as their CQL2 1.0 class (`spatial-operators` as `spatial-functions`, `temporal-operators` as
+         * `temporal-functions`, ...); a full spatial class implies the basic ones.
+         */
+        conformance: string[];
     };
     /** The (older) Query extension: `query: {"eo:cloud_cover": {lt: 10}}`. */
     query: boolean;
@@ -72,6 +80,24 @@ export interface StacCapabilities {
 }
 
 const has = (uris: string[], pattern: RegExp) => uris.some((u) => pattern.test(u));
+
+/** CQL2 1.0 filter classes and the conformance names that declare them, older names included. */
+const CQL2_CLASSES: [keyof typeof CONFORMANCE, string][] = [
+    ["advancedComparison", "advanced-comparison-operators"], ["caseInsensitive", "case-insensitive-comparison"],
+    ["accentInsensitive", "accent-insensitive-comparison"], ["basicSpatial", "basic-spatial-(operators|functions)"],
+    ["basicSpatialPlus", "basic-spatial-functions-plus"], ["spatial", "spatial-(operators|functions)"],
+    ["temporal", "temporal-(operators|functions)"], ["arrays", "array-(operators|functions)"],
+    ["propertyProperty", "property-property"], ["arithmetic", "arithmetic"],
+];
+
+/** The CQL2 1.0 URIs of the classes a server declares (see `StacCapabilities.filter.conformance`). */
+function cql2Conformance(declared: (name: string) => boolean): string[] {
+    const keys = new Set<keyof typeof CONFORMANCE>(["basic"]);
+    for (const [key, name] of CQL2_CLASSES) if (declared(name)) keys.add(key);
+    if (keys.has("spatial")) { keys.add("basicSpatial"); keys.add("basicSpatialPlus"); }
+    if (keys.has("basicSpatialPlus")) keys.add("basicSpatial");
+    return (Object.keys(CONFORMANCE) as (keyof typeof CONFORMANCE)[]).filter((k) => keys.has(k)).map((k) => CONFORMANCE[k]);
+}
 
 /**
  * Capabilities from a landing page's `conformsTo` (or a `/conformance` response).
@@ -125,6 +151,7 @@ export function parseCapabilities(landing: StacCatalogJson, conformance?: string
                 temporal: cql2("temporal-(operators|functions)"),
                 advancedComparison: cql2("advanced-comparison-operators"),
                 arrays: cql2("array-(operators|functions)"),
+                conformance: cql2Conformance(cql2),
             }
             : null,
         query: has(uris, /item-search#query$/),

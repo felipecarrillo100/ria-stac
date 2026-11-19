@@ -8,7 +8,8 @@ import {emptyProfile, parseCapabilities, type ServerProfile, type StacCapabiliti
 import type {Bbox, StacCatalogJson, StacCollectionJson, StacItemCollectionJson, StacItemJson, StacLink} from "./json.js";
 import type {HttpRequestHeaders, HttpRequestParameters} from "@luciad/ria/util/HttpRequestOptions.js";
 import {accessFetch, originOf, type AccessHook, type RiaGeoTiffRequestListener} from "../http.js";
-import {codeOf, itemMatches, planSearch, type FilterEncoding, type HttpRequestSpec, type SearchPlan, type StacSearchRequest} from "./plan.js";
+import {codeOf, itemMatches, planSearch, type Degradation, type QueryablesSchema, type FilterEncoding, type HttpRequestSpec, type SearchPlan, type StacSearchRequest} from "./plan.js";
+import type {Cql2Json} from "./cql2.js";
 import {bboxesIntersect, bboxOf} from "./geometry.js";
 import {itemFootprints} from "./select.js";
 import type {Bbox as AreaBbox, GeoJsonArea} from "./json.js";
@@ -250,6 +251,8 @@ export class StacClient {
     private readonly _listeners = new Set<(p: ServerProfile) => void>();
     private _collections?: Promise<StacCollectionJson[]>;
     private readonly _details = new Map<string, CollectionDetails>();
+    /** Queryables schemas per collection, as served (null: none), for splitting filters; see queryablesSchema. */
+    private readonly _queryableSchemas = new Map<string, QueryablesSchema | null>();
     private _static?: Promise<{ collections: StacCollectionJson[]; urls: Map<string, string> }>;
     /** The URL the landing page was read from (relative links of a static catalog resolve against it). */
     private readonly _landingUrl: string;
@@ -567,6 +570,33 @@ export class StacClient {
         return summaryQueryables(await this.describeCollection(collection));
     }
 
+    /**
+     * The JSON Schema of a collection's queryables, as the server serves it, or null when it serves none. Read
+     * once per collection and cached; {@link StacClient.search} reads it before the first page when the request
+     * has a filter for one collection on a CQL2 server, to send the server only the parts it accepts.
+     *
+     * @param collection The collection id.
+     * @returns A promise of the schema (`properties`, `additionalProperties`, ...) or null.
+     * @example
+     * ```ts
+     * const schema = await client.queryablesSchema(collectionId);
+     * const {server, client: inBrowser} = splitFilter(filter, client.capabilities.filter!.conformance, schema ?? undefined);
+     * ```
+     */
+    async queryablesSchema(collection: string): Promise<QueryablesSchema | null> {
+        if (this._queryableSchemas.has(collection)) return this._queryableSchemas.get(collection)!;
+        let schema: QueryablesSchema | null = null;
+        if (!this.capabilities.staticCatalog) {
+            try {
+                schema = await this.json(`${this.url}/collections/${encodeURIComponent(collection)}/queryables`);
+            } catch {
+                schema = null;
+            }
+        }
+        this._queryableSchemas.set(collection, schema && typeof schema === "object" ? schema : null);
+        return this._queryableSchemas.get(collection)!;
+    }
+
     /** The collections of a static catalog, crawled once (a failure is not cached). */
     private staticCatalog() {
         this._static ??= crawlCollections(this, this.landing, this._landingUrl);
@@ -749,7 +779,9 @@ export class StacClient {
             return collectionItemsPlan(this.url, request, this._options.pageSize ?? 50, Object.keys(this._options.requestHeaders ?? {}));
         }
         if (!url) throw new StacError("This STAC API has no item search");
-        const plan = planSearch(url, request, this.capabilities, this._profile, {method: this._options.method, pageSize: this._options.pageSize, exclude});
+        const one = request.collections?.length === 1 ? this._queryableSchemas.get(request.collections[0]) : undefined;
+        const plan = planSearch(url, request, this.capabilities, this._profile, {method: this._options.method, pageSize: this._options.pageSize, exclude,
+            ...(one ? {queryables: one} : {})});
         const secret = Object.keys(this._options.requestHeaders ?? {});
         return secret.length ? {...plan, code: codeOf(plan.http, secret)} : plan;
     }
@@ -886,7 +918,16 @@ export class StacClient {
             const text = await response.text();
             let json: unknown = undefined;
             try { json = text ? JSON.parse(text) : undefined; } catch { json = text; }
-            if (response.ok) return {status: response.status, json};
+            if (response.ok) {
+                // Every STAC document and page is a JSON object. A success without one is an HTML page (an error
+                // page answering 200, a bot check answering 202 with an empty body) or nothing at all.
+                if (json === null || typeof json !== "object") {
+                    const start = typeof json === "string" && json.trim() ? JSON.stringify(json.trim().slice(0, 60).replace(/\s+/g, " ")) : "an empty body";
+                    throw new StacError(`HTTP ${response.status} from ${spec.url} is not JSON (it starts with ${start}): a bot check or an error page?`,
+                        response.status, spec.url, json);
+                }
+                return {status: response.status, json};
+            }
             if (retry.statuses.includes(response.status) && attempt + 1 < retry.attempts) {
                 const after = Number(response.headers.get("Retry-After"));
                 await sleep(Number.isFinite(after) && after > 0 ? after * 1000 : retry.backoffMs * 2 ** attempt++);
@@ -1024,6 +1065,8 @@ export class StacSearch {
     private _firstResponse?: { spec: string; response: StacItemCollectionJson };
     private _excluded: FilterEncoding[] = [];
     private _rejected: Record<string, number> = {};
+    /** Degradations found while searching (a filter refused), kept across re-plans. */
+    private _notes: Degradation[] = [];
 
     /** @internal */
     constructor(private readonly client: StacClient, private readonly request: StacSearchRequest,
@@ -1051,6 +1094,18 @@ export class StacSearch {
         if (key) this._rejected[key] = (this._rejected[key] ?? 0) + 1;
     }
 
+    /** Plans again (after something was learned), keeping the degradations found while searching. */
+    private replan(request: StacSearchRequest = this.request): void {
+        const plan = this.client.plan(request, this._excluded);
+        this._plan = this._notes.length ? {...plan, degradations: [...plan.degradations, ...this._notes]} : plan;
+    }
+
+    /** The request with its predicates replaced by a filter: what the client or the verification tests. */
+    private withFilter(filter: Cql2Json | undefined): StacSearchRequest {
+        const {where: _where, filter: _filter, ...rest} = this.request;
+        return filter === undefined ? rest : {...rest, filter};
+    }
+
     /** The plan in use (it changes when verification finds that the server ignored a filter). */
     get plan(): SearchPlan {
         return this._plan;
@@ -1073,6 +1128,14 @@ export class StacSearch {
         }
         const maxItems = this.request.maxItems ?? Infinity;
         const maxScanned = this.request.maxScanned ?? 2000;
+        // A filter for one collection on a CQL2 server: its queryables decide which parts the server is sent.
+        const collections = this.request.collections ?? [];
+        if (!this.cursor && this.client.capabilities.filter && collections.length === 1
+            && (this.request.where !== undefined || this.request.filter !== undefined)) {
+            const schema = await this.client.queryablesSchema(collections[0]);
+            if (this.signal?.aborted) throw this.signal.reason;
+            if (schema) this.replan();
+        }
         let next: HttpRequestSpec | undefined = this.cursor?.next ?? this._plan.http;
         let previous: HttpRequestSpec | undefined;
         let verify = !this.cursor && this.client.options.verify !== "never";
@@ -1102,12 +1165,14 @@ export class StacSearch {
             if (verify && features.length) {
                 const encoding = this._plan.filterEncoding;
                 if (encoding === "cql2-json" || encoding === "cql2-text" || encoding === "query") {
-                    const violating = features.filter((f) => !safeMatches(f, this.request, {area: false, datetime: false}));
+                    // CQL2: only the part sent is checked (a split leaves the rest to the client); Query: all of `where`.
+                    const sent = encoding === "query" ? this.request : this.withFilter(this._plan.serverFilter);
+                    const violating = features.filter((f) => !safeMatches(f, sent, {area: false, datetime: false}));
                     const key = encoding === "query" ? "queryApplied" : "filterApplied";
                     if (violating.length) {
                         this.client.learn({[key]: "ignored"});
                         this._excluded.push(encoding);
-                        this._plan = this.client.plan(this.request, this._excluded);
+                        this.replan();
                         next = this._plan.http;
                         continue;
                     }
@@ -1119,8 +1184,10 @@ export class StacSearch {
             const clientArea = this._plan.clientApplies.includes("polygon");
             const clientPredicates = this._plan.clientApplies.includes("where/filter");
             const parts = {area: clientArea, datetime: false, predicates: clientPredicates};
+            // The client tests only what the server does not apply: the client part of a split filter.
+            const tested = this._plan.serverFilter !== undefined || this._plan.clientFilter !== undefined ? this.withFilter(this._plan.clientFilter) : this.request;
             const items = clientArea || clientPredicates || this._plan.clientApplies.includes("ids")
-                ? features.filter((f) => safeMatches(f, this.request, parts) || (this.reject(f, parts), false))
+                ? features.filter((f) => safeMatches(f, tested, parts) || (this.reject(f, parts), false))
                 : features;
             const room = maxItems - kept;
             const pageItems = items.slice(0, room);
@@ -1215,10 +1282,21 @@ export class StacSearch {
         if (spec.method === "POST" && error.status === 405) {
             this.client.learn({postToGet: true});
             if (firstPage) {
-                this._plan = this.client.plan(this.request, this._excluded);
+                this.replan();
                 return this._plan.http;
             }
             return undefined;
+        }
+        // A filter the server refuses (400 on the first page): the next encoding, ending with the client.
+        const encoding = this._plan.filterEncoding;
+        if (firstPage && error.status === 400 && (encoding === "cql2-json" || encoding === "cql2-text")
+            && !(/limit/i.test(JSON.stringify(error.body ?? "")))) {
+            const body = error.body as { description?: unknown; detail?: unknown; message?: unknown } | undefined;
+            const message = String(body?.description ?? body?.detail ?? body?.message ?? error.message).slice(0, 300);
+            this._notes.push({kind: "filter-refused", encoding, message});
+            this._excluded.push(encoding);
+            this.replan();
+            return this._plan.http;
         }
         // Page size too large: 400 naming the limit, or gateway errors from oversized responses.
         const limit = Number(spec.body?.limit ?? new URL(spec.url).searchParams.get("limit"));
@@ -1226,7 +1304,7 @@ export class StacSearch {
             || (error.status === 400 && /limit/i.test(JSON.stringify(error.body ?? "")));
         if (firstPage && sizeError && limit > 10) {
             this.client.learn({maxLimit: Math.floor(limit / 2)});
-            this._plan = this.client.plan({...this.request, limit: Math.floor(limit / 2)}, this._excluded);
+            this.replan({...this.request, limit: Math.floor(limit / 2)});
             return this._plan.http;
         }
         return undefined;

@@ -1,14 +1,13 @@
 /**
- * The CQL2 subset a STAC search needs, without a dependency: building CQL2-JSON from portable `where` predicates,
- * writing CQL2-text for GET-only servers, and evaluating against items in the browser (to verify that a server
- * applied a filter, or to apply it when the server cannot).
- *
- * Supported: = <> < <= > >=, and / or / not, like, in, between, isNull, s_intersects (geometry, bbox), t_intersects
- * and t_before / t_after with timestamps and intervals. Applications needing more can pass their own CQL2 and an
- * evaluator (for example from the `ogc-cql2` package).
+ * CQL2 for STAC searches: building CQL2-JSON from portable `where` predicates and writing CQL2-text for GET-only
+ * servers, here; evaluating filters against items in the browser (to verify that a server applied a filter, or to
+ * apply it when the server cannot), with the `ogc-cql2` package.
  */
-import {containsPoint, intersectsArea, isBbox, polygonsOf} from "./geometry.js";
-import type {GeoJsonArea, StacItemJson} from "./json.js";
+import type {Cql2Filter} from "ogc-cql2";
+import {toPredicate, type EvaluateOptions} from "ogc-cql2/evaluate";
+import {toText} from "ogc-cql2/text";
+import {itemFormats} from "./bands.js";
+import type {StacItemJson} from "./json.js";
 
 /**
  * A CQL2-JSON expression: an operation with arguments, or a boolean literal (`true` matches everything).
@@ -146,51 +145,16 @@ export function whereToQuery(where: Record<string, WhereComparison>): Record<str
 
 // ------------------------------------------------------------------------------------------------ CQL2-text
 
-const quote = (s: string) => `'${s.replace(/'/g, "''")}'`;
-
-function wkt(g: { type: string; coordinates: unknown }): string {
-    const ring = (r: number[][]) => `(${r.map((c) => c.join(" ")).join(", ")})`;
-    const poly = (p: number[][][]) => `(${p.map(ring).join(", ")})`;
-    switch (g.type) {
-        case "Point": return `POINT(${(g.coordinates as number[]).join(" ")})`;
-        case "Polygon": return `POLYGON${poly(g.coordinates as number[][][])}`;
-        case "MultiPolygon": return `MULTIPOLYGON(${(g.coordinates as number[][][][]).map(poly).join(", ")})`;
-        default: throw new Error(`No CQL2-text for geometry ${g.type}`);
-    }
-}
-
-function textArg(a: unknown): string {
-    if (a === null) return "NULL";
-    if (typeof a === "number" || typeof a === "boolean") return String(a);
-    if (typeof a === "string") return quote(a);
-    if (Array.isArray(a)) return `(${a.map(textArg).join(", ")})`;
-    if (typeof a === "object") {
-        const o = a as Record<string, unknown>;
-        // CQL2 identifiers may contain ":" and "." (eo:cloud_cover, properties.datetime); quote anything else.
-        if (typeof o.property === "string") return /^[A-Za-z_][A-Za-z0-9_.:]*$/.test(o.property) ? o.property : `"${o.property}"`;
-        if (typeof o.timestamp === "string") return `TIMESTAMP(${quote(o.timestamp)})`;
-        if (typeof o.date === "string") return `DATE(${quote(o.date)})`;
-        if (Array.isArray(o.interval)) return `INTERVAL(${(o.interval as string[]).map((v) => (v === ".." ? quote("..") : quote(v))).join(", ")})`;
-        if (Array.isArray(o.bbox)) return `BBOX(${(o.bbox as number[]).join(", ")})`;
-        if (typeof o.type === "string" && "coordinates" in o) return wkt(o as { type: string; coordinates: unknown });
-        if (typeof o.op === "string") return `(${toCql2Text(o as Cql2Json)})`;
-    }
-    throw new Error(`No CQL2-text for ${JSON.stringify(a)}`);
-}
-
 /**
- * CQL2-text of a CQL2-JSON expression (the supported subset). Throws for anything else.
+ * CQL2-text of a CQL2-JSON expression, written by the `ogc-cql2` package.
  *
- * Used for servers that accept only GET. Strings are single-quoted, property names are written bare when they are
- * identifiers (letters, digits, `_`, `.`, `:`) and double-quoted otherwise, nested expressions are parenthesised,
- * and geometries become WKT (`POINT`, `POLYGON`, `MULTIPOLYGON`) or `BBOX(...)`.
+ * Used for servers that accept only GET. Strings are single-quoted, nested expressions are parenthesised, and
+ * geometries become WKT or `BBOX(...)`: the text `fromText` of `ogc-cql2/parse` reads back to the same filter.
  *
- * @param e The expression. Supported operators: `and`, `or`, `not`, `=`, `<>`, `<`, `<=`, `>`, `>=`, `like`, `in`,
- *   `between`, `isNull`, and any spatial or temporal function `s_*` / `t_*` with two arguments.
+ * @param e The expression: any valid CQL2-JSON filter, `true` and `false` included.
  * @returns The CQL2-text string, for the `filter` parameter with `filter-lang=cql2-text`.
- * @throws `Error` when the expression uses another operator, an argument with no text form (an object that is not
- *   a property, temporal or spatial literal or an expression), or a geometry other than Point, Polygon or
- *   MultiPolygon.
+ * @throws `Cql2Error` (from `ogc-cql2`) for a value that is not a valid filter, or one CQL2-text cannot write (a
+ *   property name that is not a CQL2 identifier).
  * @example
  * ```ts
  * const text = toCql2Text({op: "and", args: [
@@ -203,92 +167,75 @@ function textArg(a: unknown): string {
  * @category Search
  */
 export function toCql2Text(e: Cql2Json): string {
-    if (typeof e === "boolean") return e ? "TRUE" : "FALSE";
-    const [a, b, c] = e.args;
-    switch (e.op.toLowerCase()) {
-        case "and": case "or": return e.args.map((x) => `(${toCql2Text(x as Cql2Json)})`).join(` ${e.op.toUpperCase()} `);
-        case "not": return `NOT (${toCql2Text(a as Cql2Json)})`;
-        case "=": case "<>": case "<": case "<=": case ">": case ">=": return `${textArg(a)} ${e.op} ${textArg(b)}`;
-        case "like": return `${textArg(a)} LIKE ${textArg(b)}`;
-        case "in": return `${textArg(a)} IN ${textArg(b)}`;
-        case "between": return `${textArg(a)} BETWEEN ${textArg(b)} AND ${textArg(c)}`;
-        case "isnull": return `${textArg(a)} IS NULL`;
-        default:
-            if (/^[st]_[a-z]+$/i.test(e.op)) return `${e.op.toUpperCase()}(${textArg(a)}, ${textArg(b)})`;
-            throw new Error(`No CQL2-text for operator ${e.op}`);
-    }
+    return toText(e as Cql2Filter);
 }
 
 // ------------------------------------------------------------------------------------------------ evaluation
 
-function value(item: StacItemJson, a: unknown): unknown {
-    if (a && typeof a === "object" && !Array.isArray(a)) {
-        const o = a as Record<string, unknown>;
-        if (typeof o.property === "string") {
-            const name = o.property.replace(/^properties\./, "");
-            if (name === "id") return item.id;
-            if (name === "collection") return item.collection;
-            if (name === "geometry") return item.geometry;
-            return item.properties[name];
-        }
-        if (typeof o.timestamp === "string") return Date.parse(o.timestamp);
-        if (typeof o.date === "string") return Date.parse(o.date);
-    }
-    return a;
+/** Reads a property of an item for ogc-cql2: `properties.` prefix ignored; `id`, `collection` and `asset_formats` derived. */
+function itemProperty(item: StacItemJson, name: string): unknown {
+    const key = name.replace(/^properties\./, "");
+    if (key === "id") return item.id;
+    if (key === "collection") return item.collection;
+    const value = item.properties?.[key];
+    if (value === undefined && key === ASSET_FORMATS) return itemFormats(item);
+    return value;
 }
 
-const isTemporalLiteral = (a: unknown): boolean => !!a && typeof a === "object" && !Array.isArray(a)
-    && (typeof (a as Record<string, unknown>).timestamp === "string" || typeof (a as Record<string, unknown>).date === "string");
+/** STAC's instant properties, so that CQL2's temporal functions read their RFC 3339 strings as instants. */
+const QUERYABLES = Object.fromEntries(["datetime", "start_datetime", "end_datetime", "created", "updated", "published", "expires"]
+    .map((name) => [name, {type: "string", format: "date-time"}]));
 
-/** An instant in milliseconds: numbers as they are, strings parsed as dates. */
-const toTime = (v: unknown): number => (typeof v === "number" ? v : Date.parse(String(v)));
-
-const cmp = (x: unknown, y: unknown): number => {
-    if (typeof x === "string" && typeof y === "string") {
-        const dx = Date.parse(x), dy = Date.parse(y);
-        if (!Number.isNaN(dx) && !Number.isNaN(dy) && /\d{4}-\d{2}/.test(x)) return dx - dy;
-        return x < y ? -1 : x > y ? 1 : 0;
-    }
-    return Number(x) - Number(y);
-};
-
-function timeRange(item: StacItemJson): [number, number] {
-    const p = item.properties;
-    const start = Date.parse(String(p.start_datetime ?? p.datetime ?? ""));
-    const end = Date.parse(String(p.end_datetime ?? p.datetime ?? ""));
-    return [start, Number.isNaN(end) ? start : end];
-}
-
-function intervalOf(a: unknown): [number, number] | undefined {
-    const o = a as Record<string, unknown>;
-    if (o && Array.isArray(o.interval)) {
-        const [s, e] = o.interval as string[];
-        return [s === ".." ? -Infinity : Date.parse(s), e === ".." ? Infinity : Date.parse(e)];
-    }
-    if (o && (typeof o.timestamp === "string" || typeof o.date === "string")) {
-        const t = Date.parse(String(o.timestamp ?? o.date));
-        return [t, t];
-    }
-    return undefined;
-}
+const OPTIONS: EvaluateOptions<StacItemJson> = {getProperty: itemProperty, queryables: QUERYABLES};
 
 /**
- * Evaluates the supported CQL2 subset against an item. Unsupported operators throw.
+ * A CQL2-JSON filter compiled once to a test on STAC items, by the `ogc-cql2` package (OGC 21-065r2, every class but
+ * the Spatial Functions beyond `s_intersects`). For many items, compile once with this rather than calling
+ * {@link evaluateCql2} for each.
  *
- * Property references read `item.properties` (a `properties.` prefix is ignored), except `id`, `collection` and
- * `geometry`, which read the item itself. A comparison on a missing or `null` property is `false`. Two strings that
- * both parse as dates (and look like `YYYY-MM...`) compare as instants, other strings lexically, everything else as
- * numbers; a comparison with a `{timestamp}` or `{date}` literal parses the property as a date. `like` matches
- * the whole value, case-sensitively. `s_intersects` tests the item's footprint against a
- * bbox literal or geometry (approximately, see {@link intersectsArea}); `t_intersects`, `t_before` and `t_after`
- * use the item's `start_datetime`/`end_datetime`, else its `datetime`, against a timestamp, date or interval.
+ * Property references read `item.properties` (a `properties.` prefix is ignored), except `id` and `collection`,
+ * which read the item, and `geometry`, the item's footprint. `asset_formats`, when the item has no such property,
+ * is derived: the formats of its data assets (see {@link itemFormats}), for filters such as
+ * `A_OVERLAPS(asset_formats, ('COG'))`. `datetime`, `start_datetime`, `end_datetime`, `created`, `updated`,
+ * `published` and `expires` are instants (RFC 3339 strings), so `T_INTERSECTS(datetime, INTERVAL(...))` works; as
+ * CQL2 requires, an instant is not compared with a date (`DATE(...)`, an interval of dates): use timestamps.
+ * CQL2's three-valued logic applies: a comparison on a missing property is unknown, and an unknown item does not
+ * match.
+ *
+ * @param e The expression, as built by {@link whereToCql2} or given by the application.
+ * @returns A predicate: `true` for the items the filter selects.
+ * @throws `Cql2Error` (from `ogc-cql2`) `invalid-filter` for a value that is not a valid filter (`BETWEEN` on
+ *   dates, for example), `unsupported` for a Spatial Function other than `s_intersects`.
+ * @example
+ * ```ts
+ * const clear = cql2Predicate({op: "<", args: [{property: "eo:cloud_cover"}, 20]});
+ * const items = page.features.filter(clear);   // items returned by a server
+ * ```
+ *
+ * @category Search
+ */
+export function cql2Predicate(e: Cql2Json): (item: StacItemJson) => boolean {
+    const key = JSON.stringify(e);
+    let predicate = compiled.get(key);
+    if (!predicate) {
+        predicate = toPredicate<StacItemJson>(e as Cql2Filter, OPTIONS);
+        if (compiled.size >= 64) compiled.delete(compiled.keys().next().value!);
+        compiled.set(key, predicate);
+    }
+    return predicate;
+}
+
+/** Filters compiled recently, by their JSON: a search tests the same filter on every item of every page. */
+const compiled = new Map<string, (item: StacItemJson) => boolean>();
+
+/**
+ * Evaluates a CQL2-JSON filter against an item, with the `ogc-cql2` package: see {@link cql2Predicate}, which
+ * compiles a filter once for many items.
  *
  * @param e The expression, as built by {@link whereToCql2} or given by the application.
  * @param item The STAC item to test.
- * @returns `true` when the item satisfies the expression. Temporal operators give `false` for items without a
- *   parsable datetime.
- * @throws `Error` for an unsupported operator (such as `t_during` or `a_contains`), whatever the item holds: also
- *   when the property is missing or the item has no datetime.
+ * @returns `true` when the filter selects the item (CQL2 TRUE); `false` for FALSE and unknown alike.
+ * @throws `Cql2Error` (from `ogc-cql2`) for an invalid or unsupported filter, see {@link cql2Predicate}.
  * @example
  * ```ts
  * const items: StacItemJson[] = page.features; // items returned by a server
@@ -298,54 +245,26 @@ function intervalOf(a: unknown): [number, number] | undefined {
  * @category Search
  */
 export function evaluateCql2(e: Cql2Json, item: StacItemJson): boolean {
-    if (typeof e === "boolean") return e;
-    const [a, b, c] = e.args;
-    const op = e.op.toLowerCase();
-    switch (op) {
-        case "and": return e.args.every((x) => evaluateCql2(x as Cql2Json, item));
-        case "or": return e.args.some((x) => evaluateCql2(x as Cql2Json, item));
-        case "not": return !evaluateCql2(a as Cql2Json, item);
-        case "isnull": { const v = value(item, a); return v === null || v === undefined; }
-    }
-    if (op === "s_intersects") {
-        const g = (b as Record<string, unknown>);
-        const area = Array.isArray(g?.bbox) ? g.bbox as [number, number, number, number] : g as unknown as GeoJsonArea;
-        if (g && (g as {type?: string}).type === "Point") {
-            const [x, y] = (g as unknown as {coordinates: number[]}).coordinates;
-            return containsPoint(polygonsOf(item.geometry), x, y);
-        }
-        return intersectsArea(item, isBbox(area) ? area : area);
-    }
-    // Unsupported operators throw whatever the item holds, before a missing value could make them false.
-    if (!SUPPORTED.has(op)) throw new Error(`Cannot evaluate CQL2 operator ${e.op}`);
-    if (op.startsWith("t_")) {
-        const [s, en] = timeRange(item), other = intervalOf(b);
-        if (!other || Number.isNaN(s)) return false;
-        if (op === "t_intersects") return s <= other[1] && en >= other[0];
-        if (op === "t_before") return en < other[0];
-        return s > other[1];   // t_after
-    }
-    // A timestamp or date literal on either side compares instants: the property is parsed as a date too.
-    const temporal = [a, b, c].some(isTemporalLiteral) || (op === "in" && Array.isArray(b) && b.some(isTemporalLiteral));
-    const raw = value(item, a);
-    if (raw === undefined || raw === null) return false;
-    const x = temporal ? toTime(raw) : raw;
-    const v = (arg: unknown) => (temporal ? toTime(value(item, arg)) : value(item, arg));
-    switch (op) {
-        case "=": return cmp(x, v(b)) === 0;
-        case "<>": return cmp(x, v(b)) !== 0;
-        case "<": return cmp(x, v(b)) < 0;
-        case "<=": return cmp(x, v(b)) <= 0;
-        case ">": return cmp(x, v(b)) > 0;
-        case ">=": return cmp(x, v(b)) >= 0;
-        case "between": return cmp(x, v(b)) >= 0 && cmp(x, v(c)) <= 0;
-        case "in": return (b as unknown[]).some((e) => cmp(x, temporal ? toTime(value(item, e)) : e) === 0);
-        default: {   // like
-            const pattern = String(b).replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/%/g, ".*").replace(/_/g, ".");
-            return new RegExp(`^${pattern}$`, "s").test(String(x));
-        }
-    }
+    return cql2Predicate(e)(item);
 }
 
-/** The operators {@link evaluateCql2} evaluates (besides `and`, `or`, `not`, `isNull` and `s_intersects`). */
-const SUPPORTED = new Set(["=", "<>", "<", "<=", ">", ">=", "between", "in", "like", "t_intersects", "t_before", "t_after"]);
+/** The derived property holding an item's data asset formats, see {@link cql2Predicate}. */
+export const ASSET_FORMATS = "asset_formats";
+
+/**
+ * The CQL2 filter that keeps items with a data asset in one of these formats: `A_OVERLAPS(asset_formats, (...))`,
+ * evaluated on the client with {@link cql2Predicate} (servers do not know `asset_formats`).
+ *
+ * @param formats Formats as {@link assetFormat} names them, e.g. `["COG"]` or `["COG", "GeoTIFF"]`.
+ * @returns The CQL2-JSON filter.
+ * @example
+ * ```ts
+ * const cogOnly = cql2Predicate(formatsFilter(["COG"]));
+ * const openable = items.filter(cogOnly);
+ * ```
+ *
+ * @category Search
+ */
+export function formatsFilter(formats: readonly string[]): Cql2Json {
+    return {op: "a_overlaps", args: [{property: ASSET_FORMATS}, [...formats]]};
+}

@@ -129,7 +129,7 @@ const FORMATS: [RegExp, string][] = [
     [/shapefile|esri-shape|\.shp\b/i, "Shapefile"], [/geo\+json|\.geojson\b/i, "GeoJSON"], [/parquet|\.parquet\b/i, "GeoParquet"],
     [/x-ndjson|\.ndjson\b/i, "NDJSON"], [/json|\.json\b/i, "JSON"], [/csv|\.csv\b/i, "CSV"], [/xml|\.xml\b/i, "XML"],
     [/jpeg|\.jpe?g\b/i, "JPEG"], [/png|\.png\b/i, "PNG"], [/jp2|\.j2k\b|\.jp2\b/i, "JPEG 2000"], [/pdf|\.pdf\b/i, "PDF"],
-    [/netcdf|x-hdf|\.nc\b|\.h5\b|\.hdf\b/i, "NetCDF/HDF"], [/zarr/i, "Zarr"], [/las|\.la[sz]\b|copc/i, "Point cloud"],
+    [/ascii-xyz|\.xyz\b/i, "XYZ"], [/netcdf|x-hdf|\.nc\b|\.h5\b|\.hdf\b/i, "NetCDF/HDF"], [/zarr/i, "Zarr"], [/las|\.la[sz]\b|copc/i, "Point cloud"],
     [/dxf|dwg|\.dxf\b|\.dwg\b/i, "CAD"], [/gltf|glb|3d-tiles|\.b3dm\b/i, "3D"], [/html|\.html?\b/i, "HTML"],
     [/text\/plain|\.txt\b/i, "Text"], [/google-earth|\.km[lz]\b/i, "KML"], [/grib|\.grib2?\b/i, "GRIB"], [/zip|\.zip\b/i, "ZIP"],
 ];
@@ -184,10 +184,35 @@ export function assetFormat(asset: Partial<StacAssetJson>): AssetFormat {
  * @category Assets and bands
  */
 export function isDataAsset(key: string, asset: Partial<StacAssetJson>): boolean {
+    return isGeoTiffAsset(asset) && isContentAsset(key, asset);
+}
+
+/** Not a thumbnail, overview, preview or metadata asset: the rule of {@link isDataAsset} without the GeoTIFF test. */
+function isContentAsset(key: string, asset: Partial<StacAssetJson>): boolean {
     const roles = asset.roles ?? [];
     if (roles.some((r) => r === "thumbnail" || r === "overview" || r === "metadata")) return false;
     if (roles.includes("visual") && !roles.includes("data")) return false;
-    return isGeoTiffAsset(asset) && !/^(thumbnail|preview|rendered_preview|tilejson)$/i.test(key);
+    return !/^(thumbnail|preview|rendered_preview|tilejson)$/i.test(key);
+}
+
+/**
+ * The formats of an item's content assets, as {@link assetFormat} names them, each once: `["COG"]`,
+ * `["XYZ (zipped)"]`, `["GeoTIFF", "PDF"]`. Thumbnails, overviews, previews and metadata are left out, by the rule
+ * of {@link isDataAsset}. This is the `asset_formats` property CQL2 filters read on the client (see
+ * `cql2Predicate` and `formatsFilter`).
+ *
+ * @param item The item; its `assets` are read.
+ * @returns The formats, in the order of the assets.
+ * @example
+ * ```ts
+ * const openable = items.filter((item) => itemFormats(item).some((f) => f === "COG" || f === "GeoTIFF"));
+ * ```
+ *
+ * @category Assets and bands
+ */
+export function itemFormats(item: { assets?: Record<string, Partial<StacAssetJson>> }): string[] {
+    const formats = Object.entries(item.assets ?? {}).filter(([key, asset]) => isContentAsset(key, asset)).map(([, asset]) => assetFormat(asset).format);
+    return [...new Set(formats)];
 }
 
 /** Common names that differ between sensors for the same role; used when the plain name is free. */

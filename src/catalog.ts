@@ -5,9 +5,10 @@
  * 2. `check(selection, collection)`: problems found before any search; `select(selection)`: search and pick items.
  */
 import type {RiaGeoTiffProblem} from "../errors.js";
-import {isDataAsset, nameAssetBands} from "./bands.js";
+import {nameAssetBands} from "./bands.js";
+import {cql2Predicate, formatsFilter} from "./cql2.js";
 import {StacError, type CollectionDescription, type Queryable, type StacClient} from "./client.js";
-import type {WhereComparison} from "./cql2.js";
+import type {Cql2Json, WhereComparison} from "./cql2.js";
 import {bboxOf, bboxesIntersect, coverageOf} from "./geometry.js";
 import type {Bbox, GeoJsonArea, StacCollectionJson, StacItemJson} from "./json.js";
 import {normaliseDatetime, type SearchPlan, type StacSearchRequest} from "./plan.js";
@@ -85,6 +86,13 @@ export interface StacSelection {
     /** Property predicates (`{"platform": {eq: "..."}}`), as the `where` of a search request. */
     where?: Record<string, WhereComparison>;
     /**
+     * A CQL2-JSON filter, ANDed with `where` and `maxCloud`, as the `filter` of a search request: the server is
+     * sent the parts its CQL2 classes and the collection's queryables allow, the client tests the rest (see
+     * `SearchPlan.serverFilter` and `clientFilter`). CQL2-text can be read into CQL2-JSON with `fromText` of
+     * `ogc-cql2/parse`.
+     */
+    filter?: Cql2Json;
+    /**
      * Maximum cloud cover in percent: a shorthand for `where: {"eo:cloud_cover": {lt: maxCloud}}` (strictly less
      * than). Items without `eo:cloud_cover` usually do not match: most servers leave them out.
      */
@@ -92,10 +100,25 @@ export interface StacSelection {
     /**
      * Stop the search after this many items. Default 300. {@link StacClient.select} requests 100 items per page
      * (the server or the profile may lower it), so 300 items cost about 3 requests. `select` counts only items
-     * with a GeoTIFF data asset: it skips the others (zipped or vector downloads, see `skipped`) and reads on, up
-     * to {@link SELECT_SCAN_LIMIT} items in all.
+     * with an asset in one of `formats`: it skips the others (zipped or vector downloads, see `skipped`) and reads
+     * on, up to `maxScanned` items in all.
      */
     maxItems?: number;
+    /**
+     * The asset formats an item must have one of, as `assetFormat` names them: `"COG"`, `"GeoTIFF"` (a
+     * GeoTIFF without the COG profile in its media type), or both (the default). Tested on the client with the
+     * CQL2 filter `A_OVERLAPS(asset_formats, (...))` (see `formatsFilter`): no server can filter on asset formats.
+     * Items without one are skipped (see {@link StacSelectionResult.skipped}). It selects items, not assets: a
+     * model opens every GeoTIFF data asset of the items picked.
+     */
+    formats?: ("COG" | "GeoTIFF")[];
+    /**
+     * How many items the search reads at most, counting those skipped for their formats. Default
+     * {@link SELECT_SCAN_LIMIT} (10000, about 100 requests of 100). The search stops sooner when `maxItems`
+     * items are kept, so this costs only when most items are skipped, as in collections that list zipped tiles
+     * beside one COG.
+     */
+    maxScanned?: number;
 }
 
 /**
@@ -151,10 +174,18 @@ export interface StacSelectionResult {
     /** Number of items the search returned with a GeoTIFF data asset (at most `maxItems`), before `pick` filtered them. */
     found: number;
     /**
-     * Items the search returned without any GeoTIFF data asset (zipped files, vector or text downloads), which no
-     * model can open: skipped, so that they do not use up `maxItems`, and not listed in `candidates`.
+     * Items the search returned without an asset in one of `formats` (zipped files, vector or text downloads, or
+     * GeoTIFFs without the COG profile when `formats` is `["COG"]`): skipped, so that they do not use up
+     * `maxItems`, and not listed in `candidates`.
      */
     skipped: number;
+    /** Items read from the server, kept or not. */
+    scanned: number;
+    /**
+     * Whether the search stopped at `maxScanned` items read before `maxItems` were kept: more items in `formats`
+     * may lie beyond. Narrow the area or the period, or raise `maxScanned`.
+     */
+    truncated: boolean;
     /** How the search was sent to the server, with its degradations. */
     plan: SearchPlan;
     /**
@@ -358,7 +389,7 @@ export function rankOf(rank: Pick["rank"]): (i: StacItemJson) => number {
 
 /**
  * The search request {@link StacClient.select} sends for a selection, for listing every item it would consider
- * ("all items found, no pick") with the same filters: the collection, `area`, `datetime`, `where` and `maxCloud`
+ * ("all items found, no pick") with the same filters: the collection, `area`, `datetime`, `where`, `filter` and `maxCloud`
  * (as `where: {"eo:cloud_cover": {lt: maxCloud}}`, merged with `where`), 100 items per page, up to `maxItems`
  * (default 300). `bands` and `pick` are not part of the search.
  *
@@ -377,17 +408,19 @@ export function selectionToRequest(selection: StacSelection): StacSearchRequest 
     return {
         collections: [selection.collection], ...(selection.area ? {area: selection.area} : {}),
         ...(selection.datetime !== undefined ? {datetime: selection.datetime} : {}),
-        ...(Object.keys(where).length ? {where} : {}), limit: 100, maxItems: selection.maxItems ?? 300,
+        ...(Object.keys(where).length ? {where} : {}), ...(selection.filter !== undefined ? {filter: selection.filter} : {}),
+        limit: 100, maxItems: selection.maxItems ?? 300,
     };
 }
 
 /**
- * How many items {@link StacClient.select} reads at most, counting the ones it skips for having no GeoTIFF data
- * asset (see {@link StacSelectionResult.skipped}): 2000, about 20 requests of 100.
+ * How many items {@link StacClient.select} reads at most by default (see {@link StacSelection.maxScanned}),
+ * counting the ones it skips for their formats (see {@link StacSelectionResult.skipped}): 10000, about 100
+ * requests of 100.
  *
  * @category Choosing data
  */
-export const SELECT_SCAN_LIMIT = 2000;
+export const SELECT_SCAN_LIMIT = 10000;
 
 /**
  * Searches and picks items for a selection.
@@ -408,18 +441,29 @@ export async function selectItems(client: StacClient, selection: StacSelection &
         throw new StacError(`The selection does not fit ${selection.collection}: ${errors.map((p) => `${p.path}: ${p.message}`).join("; ")}`,
             undefined, undefined, undefined, problems);
     }
-    let last: StacProgress = {step: "search", pages: 0, scanned: 0, kept: 0};
-    // Only items with a GeoTIFF data asset count towards maxItems: catalogs such as swisstopo's list hundreds of
-    // zipped tiles beside the one COG, which would otherwise fill the result and hide it.
+    // Only items with an asset in `formats` count towards maxItems: catalogs such as swisstopo's list thousands of
+    // zipped tiles beside the one COG, which would otherwise fill the result and hide it. No server filters on
+    // asset formats, so the CQL2 filter runs here, on every item read, and the search reads on up to maxScanned.
+    const formats = selection.formats ?? ["COG", "GeoTIFF"];
+    if (!formats.length || formats.some((f) => f !== "COG" && f !== "GeoTIFF")) {
+        const message = `must list "COG", "GeoTIFF" or both, the formats a model opens; got ${JSON.stringify(formats)}`;
+        throw new StacError(`The selection does not fit ${selection.collection}: formats ${message}`, undefined, undefined, undefined,
+            [...problems, {path: "formats", severity: "error", message}]);
+    }
+    const wanted = cql2Predicate(formatsFilter(formats));
     const limit = selection.maxItems ?? 300;
-    const request = {...selectionToRequest(selection), maxItems: Math.max(limit, SELECT_SCAN_LIMIT)};
+    const maxScanned = selection.maxScanned ?? SELECT_SCAN_LIMIT;
+    const request = {...selectionToRequest(selection), maxItems: maxScanned, maxScanned};
+    let last: StacProgress = {step: "search", pages: 0, scanned: 0, kept: 0};
     const search = client.search(request, {signal, onProgress: (p) => { last = p; onProgress?.(p); }});
     const found: StacItemJson[] = [];
-    let skipped = 0;
+    let skipped = 0, full = false;
     for await (const item of search.items()) {
-        if (!Object.entries(item.assets ?? {}).some(([key, asset]) => isDataAsset(key, asset))) skipped++;
-        else if (found.push(item) >= limit) break;
+        if (!wanted(item)) skipped++;
+        else if (found.push(item) >= limit) { full = true; break; }
     }
+    const scanned = last.scanned;
+    const truncated = !full && scanned >= maxScanned;
     if (signal?.aborted) throw signal.reason;
     onProgress?.({...last, step: "pick"});
     const pick = selection.pick ?? {};
@@ -445,9 +489,10 @@ export async function selectItems(client: StacClient, selection: StacSelection &
         candidates = kept;
     }
     if (!candidates.length) {
-        const without = skipped ? `; ${skipped} more had no GeoTIFF data asset (zipped or vector downloads) and were skipped` : "";
-        throw new StacError(`No ${selection.collection} item meets the selection (${found.length} found by the search${without})`,
-            undefined, undefined, undefined, [...problems, ...emptyReasons(found, [...records.values()], selection, search.rejected)]);
+        const without = skipped ? `; ${skipped} more had no ${formats.join(" or ")} asset (zipped or vector downloads) and were skipped` : "";
+        const stopped = truncated ? `; the search stopped after reading ${scanned} items (maxScanned) and may have missed more` : "";
+        throw new StacError(`No ${selection.collection} item meets the selection (${found.length} found by the search${without}${stopped})`,
+            undefined, undefined, undefined, [...problems, ...emptyReasons(found, [...records.values()], selection, search.rejected, {skipped, truncated, formats})]);
     }
     const score = rankOf(pick.rank);
     const result = (items: StacItemJson[], dropped: StacSelectionResult["dropped"] = []): StacSelectionResult => {
@@ -455,7 +500,7 @@ export async function selectItems(client: StacClient, selection: StacSelection &
         for (const d of dropped) exclude(d.items, "reference");
         exclude(found, "rank");
         return {
-            items, found: found.length, skipped, plan: search.plan, dropped, candidates: [...records.values()],
+            items, found: found.length, skipped, scanned, truncated, plan: search.plan, dropped, candidates: [...records.values()],
             problems: dropped.length ? [...problems, {path: "pick", severity: "warning",
                 message: `left out ${dropped.reduce((n, d) => n + d.items.length, 0)} item(s) in ${dropped.map((d) => d.reference).join(", ")}: a model needs one coordinate reference`}] : problems,
         };
@@ -479,7 +524,13 @@ export async function selectItems(client: StacClient, selection: StacSelection &
 
 /** When no item is left: one warning per rule that excluded items, saying what to relax. */
 function emptyReasons(found: StacItemJson[], records: StacCandidate[], selection: StacSelection & { pick?: Pick },
-    rejected: Record<string, number>): RiaGeoTiffProblem[] {
+    rejected: Record<string, number>, scan: { skipped: number; truncated: boolean; formats: string[] }): RiaGeoTiffProblem[] {
+    if (!found.length && scan.skipped) {
+        // Items were found, in other formats: widening would only bring more of them.
+        return [{path: "formats", severity: "warning", message: scan.truncated
+            ? `none of the ${scan.skipped} item(s) read has a ${scan.formats.join(" or ")} asset, and the search stopped there: narrow the area or the period so it reaches further, or raise maxScanned`
+            : `none of the ${scan.skipped} item(s) found has a ${scan.formats.join(" or ")} asset: the collection holds no such item in this area and period`}];
+    }
     if (!found.length) {
         // Requirements tested in the browser (static catalogs, items endpoints, client-side filters): how many items each excluded.
         const counted = Object.entries(rejected).filter(([, n]) => n > 0);
