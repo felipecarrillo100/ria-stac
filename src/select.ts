@@ -27,8 +27,8 @@ export function defaultScore(item: StacItemJson): number {
  * The fewest items, best first, whose footprints together cover an area: greedy set cover on a grid of sample
  * points (cos(latitude) weighted). `coverage` is the fraction covered; `uncovered` lists sample points left out.
  *
- * Items are visited once in score order (best first); an item is chosen when it covers at least `minGain` of the
- * area not yet covered, and the walk stops at `target` coverage or `maxItems` items. This favours good scores over
+ * Items are visited once in score order (best first); an item is chosen when it covers ground not yet covered,
+ * unless it is a sliver (less than `minGain` of the area, and mostly covered already), and the walk stops at `target` coverage or `maxItems` items. This favours good scores over
  * the absolute minimum number of items. Footprints come from {@link footprintOf}.
  *
  * @param items Candidate items, for example the results of a search over the area.
@@ -53,7 +53,10 @@ export function coverArea(items: StacItemJson[], area: Bbox | GeoJsonArea, optio
     score?: (item: StacItemJson) => number;
     /** Stop at this covered fraction. Default 0.99. */
     target?: number;
-    /** Skip items that add less than this fraction. Default 0.005. */
+    /**
+     * Skip items that add less than this fraction of the area and that are mostly covered already (slivers).
+     * Default 0.005. Small items that add mostly new ground are kept, however little of the area each covers.
+     */
     minGain?: number;
     /** Choose at most this many items. Default: no limit. */
     maxItems?: number;
@@ -77,10 +80,16 @@ export function coverArea(items: StacItemJson[], area: Bbox | GeoJsonArea, optio
     for (const item of [...items].sort((a, b) => score(a) - score(b))) {
         if (coverage >= target || chosen.length >= maxItems) break;
         const fp = footprintOf(item);
-        let gain = 0;
+        let gain = 0, inside = 0;
         const hits: number[] = [];
-        points.forEach((p, i) => { if (!covered[i] && containsPoint(fp, p.x, p.y)) { gain += p.w; hits.push(i); } });
-        if (gain / total < minGain) continue;
+        points.forEach((p, i) => {
+            if (!containsPoint(fp, p.x, p.y)) return;
+            inside += p.w;
+            if (!covered[i]) { gain += p.w; hits.push(i); }
+        });
+        // A sliver is skipped: an item adding less than minGain of the area that is also mostly covered already.
+        // Small items (1° tiles of a wide area) each add little, but they are what the mosaic is made of.
+        if (gain === 0 || (gain / total < minGain && gain < inside / 2)) continue;
         hits.forEach((i) => { covered[i] = 1; });
         coverage += gain / total;
         chosen.push(item);

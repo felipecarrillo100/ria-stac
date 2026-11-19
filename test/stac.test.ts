@@ -1,6 +1,6 @@
 import {fromText} from "ogc-cql2/parse";
 import {afterEach, describe, expect, it, vi} from "vitest";
-import {
+import {SELECT_PAGE_SIZE, 
     assetBands, bestPerPeriod, coverArea, dedupeItems, emptyProfile, evaluateCql2, groupItems, itemBandNames,
     itemsCovering, normaliseDatetime, parseCapabilities, planetaryComputerSigner, planSearch, resolveAsset, sortItems,
     StacClient, StacError, splitFilter, formatsFilter, toBandInputs, toCql2Text, type StacItemJson,
@@ -36,6 +36,8 @@ function mockServer(options: {
     queryables?: Record<string, unknown>;
     /** Answer 400 to a filter whose JSON matches. */
     refuses?: RegExp;
+    /** Answer 504 to this search page (from 1), as Planetary Computer does past page 1 for some collections. */
+    failsPage?: number;
 }) {
     const base = "https://stac.test/v1";
     const calls: { method: string; url: string; body?: Record<string, unknown> }[] = [];
@@ -51,6 +53,10 @@ function mockServer(options: {
                 links: [{rel: "search", href: `${base}/search`, type: "application/geo+json"}, {rel: "data", href: `${base}/collections`}]});
         }
         if (url.pathname === "/v1/collections/s2/queryables" && options.queryables) return json(200, options.queryables);
+        if (url.pathname === "/v1/collections/s2" && options.failsPage !== undefined) {
+            return json(200, {type: "Collection", id: "s2", stac_version: "1.1.0", description: "", license: "proprietary", links: [],
+                extent: {spatial: {bbox: [[-180, -90, 180, 90]]}, temporal: {interval: [[null, null]]}}});
+        }
         if (url.pathname === "/v1/search") {
             if (method === "POST" && options.post405) return json(405, {detail: "Method Not Allowed"});
             const params: Record<string, unknown> = {...(body ?? Object.fromEntries(url.searchParams.entries()))};
@@ -70,6 +76,7 @@ function mockServer(options: {
             const query = typeof params.query === "string" ? JSON.parse(params.query) : params.query as Record<string, {lt?: number}> | undefined;
             if (query && !options.ignoresQuery && query["eo:cloud_cover"]?.lt !== undefined) matches = matches.filter((i) => cc(i) < query["eo:cloud_cover"].lt!);
             const page = Number(params.page ?? 1);
+            if (page === options.failsPage) return new Response("upstream request timeout", {status: 504, headers: {"Content-Type": "text/plain"}});
             const size = Math.min(limit, options.pageSize ?? limit);
             const features = matches.slice((page - 1) * size, page * size);
             const links = page * size < matches.length
@@ -152,6 +159,23 @@ describe("CQL2 on the server, by the classes it declares", () => {
         expect(ids(await search.collect())).toEqual(["cog"]);
         expect(search.plan.serverFilter).toEqual({op: "<", args: [{property: "eo:cloud_cover"}, 20]});
         expect(search.plan.clientFilter).toEqual(formatsFilter(["COG"]));
+    });
+
+    it("select asks for large pages, and keeps the items of earlier pages when a later one fails", async () => {
+        const cog = {data: {href: "https://x.test/a.tif", type: "image/tiff; application=geotiff; profile=cloud-optimized"}};
+        const tiles = [0, 1, 2, 3, 4].map((i) => item(`t${i}`, {"eo:cloud_cover": i}, [i, 0, i + 1, 1], cog));
+        const {calls} = mockServer({items: tiles, pageSize: 2, failsPage: 2});
+        const client = await StacClient.connect("https://stac.test/v1", {retry: {attempts: 1}});
+        const result = await client.select({collection: "s2", area: [0, 0, 5, 1], pick: {coverage: "best"}});
+        expect(calls.find((c) => c.url.endsWith("/search"))!.body!.limit).toBe(SELECT_PAGE_SIZE);
+        // Page 2 answered 504: the two items of page 1 are picked among, with a warning, instead of an error.
+        expect(result.items.map((i) => i.id)).toEqual(["t0", "t1"]);
+        expect(result).toMatchObject({scanned: 2, truncated: true, interrupted: {page: 2, status: 504}});
+        expect(result.problems).toContainEqual(expect.objectContaining({path: "search", severity: "warning", message: expect.stringMatching(/page 2 failed \(HTTP 504\)/)}));
+        // A first page that fails is still an error: there is nothing to pick among.
+        mockServer({items: tiles, failsPage: 1});
+        const other = await StacClient.connect("https://stac.test/v1", {retry: {attempts: 1}});
+        await expect(other.select({collection: "s2", area: [0, 0, 5, 1]})).rejects.toThrow(/504/);
     });
 
     it("queryables: a property the schema forbids stays on the client; additional properties may go", async () => {
@@ -352,6 +376,19 @@ describe("selection", () => {
         expect(r.items.map((i) => i.id)).toEqual(["west", "east"]);
         expect(r.coverage).toBeGreaterThan(0.99);
         expect(itemsCovering([west, east, all], area).map((i) => i.id)).toEqual(["all"]);
+    });
+
+    it("covers a wide area with many small tiles, each under minGain of it, but skips slivers", () => {
+        // 1° tiles over a 20° × 20° area: each is 0.25 % of it, below the 0.5 % minGain.
+        const tiles = [];
+        for (let x = 0; x < 20; x++) for (let y = 0; y < 20; y++) tiles.push(item(`t${x}_${y}`, {}, [x, y, x + 1, y + 1]));
+        const wide = coverArea(tiles, [0, 0, 20, 20]);
+        expect(wide.items.length).toBeGreaterThan(390);   // it stops at the 99 % target
+        expect(wide.coverage).toBeGreaterThan(0.99);
+        // A big item mostly covered by earlier ones, adding a sliver, is still skipped.
+        const left = item("left", {"eo:cloud_cover": 1}, [0, 0, 9.98, 10]);
+        const big = item("big", {"eo:cloud_cover": 50}, [0, 0, 10, 10]);
+        expect(coverArea([left, big], [0, 0, 10, 10]).items.map((i) => i.id)).toEqual(["left"]);
     });
 
     it("picks the best item per period, groups, dedupes and sorts", () => {

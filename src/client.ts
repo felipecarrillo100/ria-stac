@@ -64,7 +64,7 @@ export interface StacClientOptions {
     method?: "auto" | "GET" | "POST";
     /**
      * Page size of searches whose request gives no `limit`. Default 50: large pages fail on several servers (502
-     * or 504). {@link StacClient.select} always asks for 100.
+     * or 504). {@link StacClient.select} asks for {@link SELECT_PAGE_SIZE} (1000).
      */
     pageSize?: number;
     /** Retries of failed API requests (network errors and the listed HTTP statuses). */

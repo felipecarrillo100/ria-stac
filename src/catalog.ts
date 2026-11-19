@@ -186,6 +186,18 @@ export interface StacSelectionResult {
      * may lie beyond. Narrow the area or the period, or raise `maxScanned`.
      */
     truncated: boolean;
+    /**
+     * Set when a page after the first failed (a timeout, often): the items were picked among those of the pages
+     * before it, `truncated` is true, and `problems` holds a warning with path `"search"`.
+     */
+    interrupted?: {
+        /** The page that failed, from 1. */
+        page: number;
+        /** Its HTTP status, when the server answered. */
+        status?: number;
+        /** The error message. */
+        message: string;
+    };
     /** How the search was sent to the server, with its degradations. */
     plan: SearchPlan;
     /**
@@ -423,6 +435,16 @@ export function selectionToRequest(selection: StacSelection): StacSearchRequest 
 export const SELECT_SCAN_LIMIT = 10000;
 
 /**
+ * Page size of {@link StacClient.select}: 1000 items per request (less where the server was seen to accept less).
+ * Picking reads every item in the area, and some servers answer the first page quickly but time out on the pages
+ * after it (Planetary Computer's `alos-dem`, for one: 504 after 15 s on every page past the first), so the fewer
+ * pages the better. A server that refuses the size gets half of it, see {@link StacClient.search}.
+ *
+ * @category Choosing data
+ */
+export const SELECT_PAGE_SIZE = 1000;
+
+/**
  * Searches and picks items for a selection.
  *
  * @internal
@@ -453,17 +475,27 @@ export async function selectItems(client: StacClient, selection: StacSelection &
     const wanted = cql2Predicate(formatsFilter(formats));
     const limit = selection.maxItems ?? 300;
     const maxScanned = selection.maxScanned ?? SELECT_SCAN_LIMIT;
-    const request = {...selectionToRequest(selection), maxItems: maxScanned, maxScanned};
+    const request = {...selectionToRequest(selection), limit: SELECT_PAGE_SIZE, maxItems: maxScanned, maxScanned};
     let last: StacProgress = {step: "search", pages: 0, scanned: 0, kept: 0};
     const search = client.search(request, {signal, onProgress: (p) => { last = p; onProgress?.(p); }});
     const found: StacItemJson[] = [];
-    let skipped = 0, full = false;
-    for await (const item of search.items()) {
-        if (!wanted(item)) skipped++;
-        else if (found.push(item) >= limit) { full = true; break; }
+    let skipped = 0, full = false, interrupted: StacSelectionResult["interrupted"];
+    try {
+        for await (const item of search.items()) {
+            if (!wanted(item)) skipped++;
+            else if (found.push(item) >= limit) { full = true; break; }
+        }
+    } catch (e) {
+        // A later page failing (a server timeout, often) keeps what the earlier pages gave: picked, with a warning.
+        if (signal?.aborted || !found.length) throw e;
+        const status = e instanceof StacError ? e.status : undefined;
+        interrupted = {page: last.pages + 1, ...(status !== undefined ? {status} : {}), message: e instanceof Error ? e.message : String(e)};
+        problems.push({path: "search", severity: "warning",
+            message: `page ${interrupted.page} failed (${status !== undefined ? `HTTP ${status}` : interrupted.message.slice(0, 120)}): `
+                + `picked among the ${last.scanned} item(s) of the pages before it; more may lie beyond. Narrow the area or the period to read them all`});
     }
     const scanned = last.scanned;
-    const truncated = !full && scanned >= maxScanned;
+    const truncated = !full && (scanned >= maxScanned || interrupted !== undefined);
     if (signal?.aborted) throw signal.reason;
     onProgress?.({...last, step: "pick"});
     const pick = selection.pick ?? {};
@@ -500,7 +532,7 @@ export async function selectItems(client: StacClient, selection: StacSelection &
         for (const d of dropped) exclude(d.items, "reference");
         exclude(found, "rank");
         return {
-            items, found: found.length, skipped, scanned, truncated, plan: search.plan, dropped, candidates: [...records.values()],
+            items, found: found.length, skipped, scanned, truncated, ...(interrupted ? {interrupted} : {}), plan: search.plan, dropped, candidates: [...records.values()],
             problems: dropped.length ? [...problems, {path: "pick", severity: "warning",
                 message: `left out ${dropped.reduce((n, d) => n + d.items.length, 0)} item(s) in ${dropped.map((d) => d.reference).join(", ")}: a model needs one coordinate reference`}] : problems,
         };

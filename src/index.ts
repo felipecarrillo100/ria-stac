@@ -29,6 +29,6 @@ export {bboxesIntersect, bboxOf, coverageOf, footprintOf, intersectsArea} from "
 export {assetBandMap, isCategoricalAsset, itemBandNames, toBandInputs} from "./bridge.js";
 export type {ItemBandsOptions} from "./bridge.js";
 export type {Bbox, GeoJsonArea, StacAssetJson, StacCatalogJson, StacCollectionJson, StacItemCollectionJson, StacItemJson, StacLink} from "./json.js";
-export {collectionBands, elevationHint, SELECT_SCAN_LIMIT, selectionToRequest} from "./catalog.js";
+export {collectionBands, elevationHint, SELECT_PAGE_SIZE, SELECT_SCAN_LIMIT, selectionToRequest} from "./catalog.js";
 export type {CollectionDetails, CollectionSummary, Pick, StacCandidate, StacSelection, StacSelectionResult} from "./catalog.js";
 export type {StacCatalogSource, StacItemOptions, StacItemsSource, StacModelSource} from "./source.js";
