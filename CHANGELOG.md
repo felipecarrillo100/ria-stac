@@ -17,8 +17,12 @@ Planetary Computer, Copernicus Data Space, INPE, swisstopo, the eoAPI demo and G
   `Accept: application/schema+json`. Queryables are requested only when the Filter extension is declared (INPE and
   swisstopo answered 404).
 - Redirects: a browser hides the target of `redirect: "manual"`, so every redirect of a request with headers or
-  parameters was refused. Now the browser follows it when only `Authorization` (dropped on cross-origin redirects)
-  or parameters are sent; with other headers it is refused with a clear message.
+  parameters was refused. Now a probe without any secret (no headers or parameters of the options, no cookies)
+  finds where the redirect ends; the request is sent with its secrets only when that is the same origin, straight to
+  the final URL. A redirect to another origin, one that happens only with credentials, a second redirect, and a
+  redirected POST are refused. Checked in Chromium: browsers drop `Authorization` on a cross-origin redirect but
+  forward other headers such as `X-Api-Key`, and a server may copy query parameters into its redirect, which is why
+  following blindly is not safe.
 - `Retry-After` is read as seconds or an HTTP date; a server asking to wait longer than `retry.maxWaitMs`
   (default 60 s) is not retried.
 - A page of 1000 collections that does not come within 10 s is asked again with the server's default page size.

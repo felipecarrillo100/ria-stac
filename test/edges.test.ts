@@ -11,35 +11,47 @@ const at = (r: Response, url: string) => Object.defineProperty(r, "url", {value:
 const opaque = () => ({type: "opaqueredirect", status: 0, ok: false, headers: new Headers(), url: ""}) as unknown as Response;
 
 describe("redirects a browser hides", () => {
-    it("lets the browser follow them when only parameters or Authorization are sent", async () => {
-        const calls: { url: string; redirect?: RequestRedirect }[] = [];
+    /** A browser: manual redirects are opaque; follow ends at `final` (with `redirected` set). */
+    function browser(final: string, options: { redirectsOnlyWithCredentials?: boolean; finalRedirects?: boolean } = {}) {
+        const calls: { url: string; redirect?: RequestRedirect; headers: Record<string, string>; credentials?: RequestCredentials }[] = [];
         const f = vi.fn(async (input: string | URL, init?: RequestInit) => {
-            calls.push({url: String(input), redirect: init?.redirect});
+            const url = String(input);
+            calls.push({url, redirect: init?.redirect, headers: {...(init?.headers as Record<string, string> ?? {})}, credentials: init?.credentials});
+            if (url.startsWith(final) && !(options.finalRedirects && init?.redirect === "manual")) return at(json({ok: true}), url);
             if (init?.redirect === "manual") return opaque();
-            return at(json({ok: true}), "https://api.test/v1/");
+            if (options.redirectsOnlyWithCredentials) return at(json({}, 401), url);
+            return Object.defineProperty(at(json({ok: true}), final), "redirected", {value: true});
         }) as unknown as typeof fetch;
-        const r = await accessFetch("https://api.test/v1", {requestParameters: {token: "t"}, requestHeaders: {Authorization: "Bearer x"}}, {}, f);
+        return {f, calls};
+    }
+    const secret = {requestHeaders: {Authorization: "Bearer T", "X-Api-Key": "K"}, requestParameters: {token: "P"}};
+    const leaks = (c: { url: string; headers: Record<string, string> }) => c.url.includes("token=") || "Authorization" in c.headers || "X-Api-Key" in c.headers;
+
+    it("finds the target with a probe that carries no secrets, then sends them straight to a same-origin target", async () => {
+        const {f, calls} = browser("https://api.test/v1/");
+        const r = await accessFetch("https://api.test/v1", secret, {headers: {Accept: "application/json"}}, f);
         expect(await r.json()).toEqual({ok: true});
-        expect(calls.map((c) => c.redirect)).toEqual(["manual", "follow"]);
+        expect(calls.map((c) => c.redirect)).toEqual(["manual", "follow", "manual"]);
+        expect(leaks(calls[1])).toBe(false);
+        expect(calls[1]).toMatchObject({url: "https://api.test/v1", credentials: "omit", headers: {Accept: "application/json"}});
+        expect(calls[2]).toMatchObject({url: "https://api.test/v1/?token=P", headers: {Authorization: "Bearer T", "X-Api-Key": "K"}});
     });
 
-    it("refuses them when another header could reach a different origin", async () => {
-        const f = vi.fn(async () => opaque()) as unknown as typeof fetch;
-        await expect(accessFetch("https://api.test/v1", {requestHeaders: {"X-Api-Key": "k"}}, {}, f))
-            .rejects.toThrow(/X-Api-Key could reach another origin/);
+    it("refuses a redirect to another origin without sending it any secret", async () => {
+        const {f, calls} = browser("https://other.test/data");
+        await expect(accessFetch("https://api.test/v1", secret, {}, f)).rejects.toThrow(/redirects to other\.test/);
+        expect(calls.filter((c) => !c.url.startsWith("https://api.test/v1?") && c.redirect !== "manual").every((c) => !leaks(c))).toBe(true);
+        expect(calls.some((c) => c.url.startsWith("https://other.test") && leaks(c))).toBe(false);
     });
 
-    it("retries a same-origin target that refuses the request with the parameters", async () => {
-        const urls: string[] = [];
-        const f = vi.fn(async (input: string | URL, init?: RequestInit) => {
-            urls.push(String(input));
-            if (init?.redirect === "manual") return opaque();
-            if (String(input).includes("/v1/?")) return json({ok: true});
-            return at(json({}, 401), "https://api.test/v1/");
-        }) as unknown as typeof fetch;
-        const r = await accessFetch("https://api.test/v1", {requestParameters: {token: "t"}}, {}, f);
-        expect(r.status).toBe(200);
-        expect(urls.at(-1)).toBe("https://api.test/v1/?token=t");
+    it("refuses when the target cannot be found without the credentials, when it redirects again, and for POST", async () => {
+        await expect(accessFetch("https://api.test/v1", secret, {}, browser("https://api.test/v1/", {redirectsOnlyWithCredentials: true}).f))
+            .rejects.toThrow(/does not redirect without the credentials/);
+        await expect(accessFetch("https://api.test/v1", secret, {}, browser("https://api.test/v1/", {finalRedirects: true}).f))
+            .rejects.toThrow(/redirects again/);
+        const post = browser("https://api.test/v1/");
+        await expect(accessFetch("https://api.test/v1", secret, {method: "POST", body: "{}"}, post.f)).rejects.toThrow(/POST request was redirected/);
+        expect(post.calls).toHaveLength(1);
     });
 });
 

@@ -64,7 +64,7 @@ export type AccessKind = "stac-api" | "stac-asset";
 export type AccessHook = (url: URL, kind: AccessKind) => HttpRequestOptions | null;
 
 /**
- * The fetch `credentials` mode of LuciadRIA's `credentials` option.
+ * The fetch `credentials` mode of the `credentials` option (`true`, `false` or a fetch mode, as in LuciadRIA).
  *
  * @internal
  *
@@ -132,7 +132,8 @@ export class RedirectWithheldError extends Error {
 /**
  * Fetches `url` with the given options. A request with headers or parameters uses `redirect: "manual"`: redirects on
  * the same origin are followed (at most 5), a redirect to another origin rejects with a
- * {@link RedirectWithheldError}. Browsers hide the target of a manual redirect: such a redirect is refused too.
+ * {@link RedirectWithheldError}. Browsers hide the target of a manual redirect: it is found with a probe that
+ * carries no secrets first (see `followHidden`).
  *
  * @internal
  *
@@ -213,7 +214,7 @@ async function accessFetchOnce(url: string, access: HttpRequestOptions | null, i
     for (let hop = 0; hop < 6; hop++) {
         const response = await fetchFn(addParameters(current, params), {...init, headers, credentials, ...(guarded ? {redirect: "manual"} : {})});
         if (!guarded || !(response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400 && response.status !== 304))) return response;
-        if (response.type === "opaqueredirect") return followHidden(current, access, {...init, headers, credentials}, fetchFn);
+        if (response.type === "opaqueredirect") return followHidden(current, access, init, fetchFn);
         const location = response.headers.get("Location");
         if (!location) throw new RedirectWithheldError("an undisclosed host", current);
         const next = new URL(location, current);
@@ -225,24 +226,33 @@ async function accessFetchOnce(url: string, access: HttpRequestOptions | null, i
 }
 
 /**
- * A redirect whose target a browser hides (`redirect: "manual"` gives an opaque response without `Location`). The
- * request is sent again and the browser follows the redirect itself, when nothing secret can reach another origin:
- * the query parameters are only in the first URL (a redirect target gets what its `Location` holds), and the only
- * header allowed is `Authorization`, which browsers drop on a redirect to another origin (Fetch standard). Other
- * headers (an API key in `X-Api-Key`) would be sent on, so such a redirect is refused. A redirect that ends on
- * the same origin and is refused (401, 403) is retried there with the parameters.
+ * A redirect whose target a browser hides (`redirect: "manual"` gives an opaque response without `Location`).
+ *
+ * Following it blindly could send secrets to another origin: browsers drop `Authorization` on a cross-origin
+ * redirect, but forward other headers (an API key in `X-Api-Key`), and a server may copy the query parameters into
+ * its `Location`. So the target is found first with a probe that carries no secrets (no headers or parameters of the
+ * options, no cookies), and the request is sent with them only when the redirect ends on the same origin, straight
+ * to the final URL. That costs one more request, and only when a redirect happens.
+ *
+ * Refused (a {@link RedirectWithheldError}): a redirect that ends on another origin, one the probe does not reach
+ * (the redirect only happens with the credentials, so its target stays unknown), a final URL that redirects again,
+ * and a redirected request other than GET (its body would be lost or resent elsewhere).
  */
 async function followHidden(url: string, access: HttpRequestOptions | null, init: RequestInit, fetchFn: typeof fetch): Promise<Response> {
-    const secretHeaders = Object.keys(access?.requestHeaders ?? {}).filter((h) => h.toLowerCase() !== "authorization");
-    if (secretHeaders.length) {
-        throw new RedirectWithheldError("an undisclosed host", url,
-            `the browser does not show where it goes, and the header(s) ${secretHeaders.join(", ")} could reach another origin`);
+    const method = (init.method ?? "GET").toUpperCase();
+    if (method !== "GET") throw new RedirectWithheldError("an undisclosed host", url, `a ${method} request was redirected`);
+    const probe = await fetchFn(url, {method: "GET", headers: init.headers, signal: init.signal, credentials: "omit", redirect: "follow"});
+    await probe.body?.cancel().catch(() => undefined);
+    let final: URL | null = null;
+    try { final = probe.url ? new URL(probe.url) : null; } catch { final = null; }
+    if (!final || !probe.redirected) {
+        throw new RedirectWithheldError("an undisclosed host", url, "the browser does not show where it goes, and it does not redirect without the credentials");
     }
-    const params = access?.requestParameters;
-    const response = await fetchFn(addParameters(url, params), {...init, redirect: "follow"});
-    const final = response.url ? new URL(response.url) : null;
-    if (!isEmpty(params) && final && final.origin === new URL(url).origin && (response.status === 401 || response.status === 403)) {
-        return fetchFn(addParameters(final.toString(), params), {...init, redirect: "follow"});
+    if (final.origin !== new URL(url).origin) throw new RedirectWithheldError(final.host, url);
+    const headers = {...(init.headers as Record<string, string> | undefined ?? {}), ...(access?.requestHeaders ?? {})};
+    const response = await fetchFn(addParameters(final.toString(), access?.requestParameters), {...init, headers, credentials: credentialsMode(access?.credentials), redirect: "manual"});
+    if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400 && response.status !== 304)) {
+        throw new RedirectWithheldError("an undisclosed host", final.toString(), "it redirects again");
     }
     return response;
 }
