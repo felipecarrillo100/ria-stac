@@ -5,7 +5,8 @@
 import {StacError, type StacClient} from "./client.js";
 import type {StacCollectionJson, StacItemJson, StacLink} from "./json.js";
 import {absolutize} from "./links.js";
-import {bboxOf} from "./geometry.js";
+import {bboxesIntersect, bboxOf} from "./geometry.js";
+import type {Bbox} from "./json.js";
 import {codeOf, normaliseDatetime, type Degradation, type SearchPlan, type StacSearchRequest} from "./plan.js";
 
 /** Defaults of `StacClientOptions.crawl`. */
@@ -19,7 +20,15 @@ function limits(client: StacClient) {
 }
 
 /** Links of one relation, absolute (documents are absolutized when read). */
-const hrefs = (doc: Doc, rel: string) => (doc.links ?? []).filter((l) => l?.rel === rel && typeof l.href === "string").map((l) => l.href);
+const linksOf = (doc: Doc, rel: string) => (doc.links ?? []).filter((l) => l?.rel === rel && typeof l.href === "string");
+const hrefs = (doc: Doc, rel: string) => linksOf(doc, rel).map((l) => l.href);
+
+/** A collection's (or catalog's, where one declares it) spatial extent, when valid. */
+function extentOf(doc: Doc): Bbox | undefined {
+    const bbox = (doc.extent as { spatial?: { bbox?: unknown[] } } | undefined)?.spatial?.bbox?.[0];
+    return Array.isArray(bbox) && bbox.length >= 4 && bbox.every((v) => typeof v === "number")
+        ? (bbox.length === 6 ? [bbox[0], bbox[1], bbox[3], bbox[4]] : bbox.slice(0, 4)) as Bbox : undefined;
+}
 
 /** Reads a document and resolves its relative hrefs against its URL. */
 async function read(client: StacClient, url: string, signal?: AbortSignal): Promise<Doc> {
@@ -94,8 +103,21 @@ export async function crawlCollections(client: StacClient, landing: Doc, landing
  */
 export async function* crawlItems(client: StacClient, roots: { url: string; collection?: string }[], options: {
     batch: number; maxScanned: number; signal?: AbortSignal;
+    /** The search area: children and links whose extent misses it are not followed. */
+    area?: Bbox;
+    /** Counts what was left unread for the area. */
+    stats?: { pruned: number };
 }): AsyncGenerator<StacItemJson[]> {
-    const {maxDepth, maxDocuments, concurrency} = limits(client);
+    const {maxDepth, maxDocuments, concurrency, linkBbox} = limits(client);
+    const area = options.area;
+    /** Whether a link of `parent` is known to miss the area (from crawl.linkBbox). */
+    const misses = (link: StacLink, parent: Doc) => {
+        if (!area || !linkBbox) return false;
+        const bbox = linkBbox(link, {type: parent.type, id: parent.id});
+        const out = bbox !== undefined && !bboxesIntersect(area, bbox);
+        if (out && options.stats) options.stats.pruned++;
+        return out;
+    };
     const seen = new Set<string>();
     const queue: { url: string; depth: number; collection?: string }[] = roots.map((r) => ({...r, depth: 0}));
     for (const r of roots) seen.add(r.url);
@@ -124,6 +146,12 @@ export async function* crawlItems(client: StacClient, roots: { url: string; coll
         const doc = depth === 0 ? await read(client, url, options.signal) : await readOrSkip(client, url, options.signal);
         if (!doc) continue;
         const here = doc.type === "Collection" && typeof doc.id === "string" ? doc.id : collection;
+        // A child that declares an extent outside the area: none of its items can match.
+        const extent = depth > 0 && area && doc.type !== "Feature" ? extentOf(doc) : undefined;
+        if (extent && !bboxesIntersect(area!, extent)) {
+            if (options.stats) options.stats.pruned++;
+            continue;
+        }
         if (doc.type === "Feature") {
             const item = doc as unknown as StacItemJson;
             if (!item.collection && here) item.collection = here;
@@ -131,8 +159,14 @@ export async function* crawlItems(client: StacClient, roots: { url: string; coll
             yield [item];
             continue;
         }
-        for (const href of hrefs(doc, "item")) if (!seen.has(href)) { seen.add(href); pending.push({url: href, collection: here}); }
-        if (depth < maxDepth) for (const href of hrefs(doc, "child")) if (!seen.has(href)) { seen.add(href); queue.push({url: href, depth: depth + 1, collection: here}); }
+        for (const link of linksOf(doc, "item")) {
+            if (!seen.has(link.href) && !misses(link, doc)) { seen.add(link.href); pending.push({url: link.href, collection: here}); }
+        }
+        if (depth < maxDepth) {
+            for (const link of linksOf(doc, "child")) {
+                if (!seen.has(link.href) && !misses(link, doc)) { seen.add(link.href); queue.push({url: link.href, depth: depth + 1, collection: here}); }
+            }
+        }
         yield* flush(false);
     }
     yield* flush(true);

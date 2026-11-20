@@ -30,6 +30,13 @@ export type GeoTiffModelErrorCause =
      */
     | "READ_FAILED"
     /**
+     * One read would decode more than `maxReadSize` (see {@link CreateModelOptions}): the file has no overview coarse
+     * enough for the view, as in a large GeoTIFF without overviews seen zoomed out. Found as the `originalError` of
+     * a {@link GeoTiffReadError}; its area is shown as no data, and appears when zoomed in. Convert the file to a COG
+     * (`gdal_translate -of COG`), or raise `maxReadSize`.
+     */
+    | "READ_TOO_LARGE"
+    /**
      * The inputs of a {@link GeoTiffTileSetModel} declare different coordinate references (and no
      * `options.reference` was given).
      */

@@ -136,6 +136,30 @@ export function bboxesIntersect(a: Bbox, b: Bbox): boolean {
 }
 
 /**
+ * Whether a bbox covers the whole world: every longitude and at least 120 degrees of latitude.
+ *
+ * Global collections (Sentinel-2, Landsat, a world DEM) declare such an extent, so a test on the map view never
+ * removes them; this tells them apart from regional ones. The 120 degrees let land-only global extents (for example
+ * 60 S to 84 N) count as global, while a hemisphere or a polar region (90 degrees or less) stays regional.
+ *
+ * @param bbox `[west, south, east, north]` in degrees; `west > east` crosses the antimeridian.
+ * @returns True for a global extent.
+ * @example
+ * ```ts
+ * isGlobalBbox([-180, -90, 180, 90]);   // true
+ * isGlobalBbox([-180, 0, 180, 90]);     // false: the northern hemisphere
+ * isGlobalBbox([-10, 35, 5, 44]);       // false
+ * ```
+ *
+ * @category Selection helpers
+ */
+export function isGlobalBbox(bbox: Bbox): boolean {
+    const [w, s, e, n] = bbox;
+    const lon = w > e ? e + 360 - w : e - w;
+    return lon >= 359 && n - s >= 120;
+}
+
+/**
  * Sample points (cell centres) of an area on an n x n grid over its bbox, with cos(latitude) area weights.
  *
  * Only cell centres inside the area are returned, so a polygon gives fewer than `n * n` points.

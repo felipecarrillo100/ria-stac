@@ -10,7 +10,7 @@ import type {HttpRequestHeaders, HttpRequestParameters} from "@luciad/ria/util/H
 import {accessFetch, originOf, type AccessHook, type RiaGeoTiffRequestListener} from "../http.js";
 import {codeOf, itemMatches, planSearch, type Degradation, type QueryablesSchema, type FilterEncoding, type HttpRequestSpec, type SearchPlan, type StacSearchRequest} from "./plan.js";
 import type {Cql2Json} from "./cql2.js";
-import {bboxesIntersect, bboxOf} from "./geometry.js";
+import {bboxesIntersect, bboxOf, isGlobalBbox} from "./geometry.js";
 import {itemFootprints} from "./select.js";
 import type {Bbox as AreaBbox, GeoJsonArea} from "./json.js";
 import {absolutize} from "./links.js";
@@ -106,6 +106,25 @@ export interface StacClientOptions {
          * catalog itself, and the collections a search starts from, must always be readable.
          */
         onError?: "skip" | "throw";
+        /**
+         * The extent of a linked document, when the application knows it without reading it: called during a search
+         * with an area, for every `child` and `item` link of a static catalog (with its href absolute); a link whose
+         * bbox `[west, south, east, north]` misses the area is not followed, so a catalog that names its parts after
+         * their tiles is searched without reading the other tiles. Return undefined when unknown: the link is
+         * followed. Without it, only children that declare an extent (collections) are skipped, once read.
+         *
+         * @example
+         * ```ts
+         * // GEM-15 names its sub-catalogs after their 10-degree block: "p30_m120" is 30..40 N, 120..110 W.
+         * const crawl = {linkBbox: (link: StacLink) => {
+         *     const m = /^([pm])(\d+)_([pm])(\d+)$/.exec(link.title ?? "");
+         *     if (!m) return undefined;
+         *     const lat = (m[1] === "m" ? -1 : 1) * Number(m[2]), lon = (m[3] === "m" ? -1 : 1) * Number(m[4]);
+         *     return [lon, lat, lon + 10, lat + 10] as Bbox;
+         * }};
+         * ```
+         */
+        linkBbox?: (link: StacLink, parent: { type?: string; id?: string }) => Bbox | undefined;
     };
 }
 
@@ -188,6 +207,11 @@ export interface StacProgress {
     kept: number;
     /** The server's total for the search, when it reports one. */
     matched?: number;
+    /**
+     * Static catalogs: links and documents left unread because their extent misses the area (see
+     * `StacClientOptions.crawl.linkBbox`).
+     */
+    pruned?: number;
 }
 
 /**
@@ -225,6 +249,81 @@ export class StacError extends RiaGeoTiffError {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Collections asked for per page from a server that declares STAC Collection Search, which defines `limit` on
+ * `/collections`: for the full list and for filtered ones, one request instead of dozens (Copernicus Data Space
+ * lists 428 collections, 10 per page by default). A server that refuses this `limit` (HTTP 400) is asked again
+ * without it. Other servers are asked with their default page size.
+ *
+ * @category Choosing data
+ */
+export const COLLECTION_PAGE_SIZE = 1000;
+
+/**
+ * What to keep of a catalog's collections; see {@link StacClient.findCollections} and {@link StacClient.collections}.
+ * Every part is optional, and an empty filter keeps every collection.
+ *
+ * @category Choosing data
+ */
+export interface CollectionFilter {
+    /** Area of interest `[west, south, east, north]` in longitude/latitude (`west > east` crosses the antimeridian). */
+    bbox?: Bbox;
+    /**
+     * Interval `[start, end]` as RFC 3339 (or anything `Date.parse` reads), null for an open end. A date without a
+     * time (`"2024-12-31"`) as the end means the end of that day.
+     */
+    datetime?: [string | null, string | null];
+    /** Text to look for in the id, title, description and keywords (case-insensitive substring). */
+    q?: string;
+    /**
+     * Drop collections whose extent is the whole world (see {@link isGlobalBbox}): what remains is regional data.
+     * Collections that declare no extent are kept. Default false.
+     */
+    regional?: boolean;
+    /**
+     * Let the server filter first when it declares STAC Collection Search: `bbox` and `datetime` are sent to
+     * `/collections`, and every test of the filter is then applied again to what it returns, so a server that
+     * ignores a parameter changes nothing. `q` is never sent: servers search words (`"sent"` finds nothing where
+     * the substring test finds every Sentinel collection), and some fail on a phrase. When the request fails, the
+     * full list is filtered here instead. Default true.
+     */
+    server?: boolean;
+    /** Called with what the server step did, when it ran (it does not when the server cannot filter collections). */
+    onServer?: (step: ServerCollectionSearch) => void;
+}
+
+/**
+ * The server step of a collection filter (STAC Collection Search), see {@link CollectionFilter.onServer}.
+ *
+ * @category Choosing data
+ */
+export interface ServerCollectionSearch {
+    /** The parameters sent to the server. */
+    sent: ("bbox" | "datetime")[];
+    /** The first URL requested. */
+    url: string;
+    /** How many collections the server returned, before the tests here; undefined when it failed. */
+    count?: number;
+    /** Why the request failed; the full list was then filtered here instead. */
+    error?: string;
+}
+
+/** A filter's interval in milliseconds; a date-only end is the end of that day. */
+function intervalMs(datetime: [string | null, string | null] | undefined): [number, number] {
+    const [start, end] = datetime ?? [null, null];
+    const t0 = start ? Date.parse(start) : -Infinity;
+    const t1 = end ? Date.parse(end) + (/^\d{4}-\d{2}-\d{2}$/.test(end.trim()) ? 86_400_000 - 1 : 0) : Infinity;
+    return [Number.isNaN(t0) ? -Infinity : t0, Number.isNaN(t1) ? Infinity : t1];
+}
+
+/** The `datetime` parameter of a collection search (RFC 3339, `..` for an open end), or undefined for none. */
+function datetimeParam(datetime: [string | null, string | null] | undefined): string | undefined {
+    const [t0, t1] = intervalMs(datetime);
+    if (t0 === -Infinity && t1 === Infinity) return undefined;
+    const iso = (t: number) => (Number.isFinite(t) ? new Date(t).toISOString() : "..");
+    return `${iso(t0)}/${iso(t1)}`;
+}
 
 /**
  * A client for one STAC API. Create it with {@link StacClient.connect}; it reads the landing page and conformance
@@ -432,7 +531,8 @@ export class StacClient {
     /**
      * All collections (following paging links), fetched once and cached.
      *
-     * Reads the landing page's `data` link, else `{url}/collections`, and follows `next` links until there are none,
+     * Reads the landing page's `data` link, else `{url}/collections` (with `limit` {@link COLLECTION_PAGE_SIZE} when
+     * the server declares STAC Collection Search), and follows `next` links until there are none,
      * a link repeats, or 10000 collections were read. A static catalog is crawled instead: the landing page when it
      * is a collection, else the collections reached by `child` links, breadth first, within
      * {@link StacClientOptions.crawl} (default 4 links deep, 500 documents).
@@ -448,16 +548,8 @@ export class StacClient {
      */
     listCollections(): Promise<StacCollectionJson[]> {
         this._collections ??= this.capabilities.staticCatalog ? this.staticCatalog().then((s) => s.collections) : (async () => {
-            const out: StacCollectionJson[] = [];
-            let url: string | undefined = this.link("data") ?? `${this.url}/collections`;
-            const seen = new Set<string>();
-            while (url && !seen.has(url) && out.length < 10000) {
-                seen.add(url);
-                const page: { collections?: StacCollectionJson[]; links?: StacLink[] } = await this.json(url);
-                out.push(...(page.collections ?? []));
-                url = page.links?.find((l) => l.rel === "next")?.href;
-            }
-            return out;
+            // Collection Search defines limit on /collections: one large page instead of dozens of small ones.
+            return this.capabilities.collectionSearch ? this.pageCollectionsLarge(new URL(this.collectionsUrl)) : this.pageCollections(this.collectionsUrl);
         })();
         // A failure is not cached: the next call tries again.
         const pending = this._collections;
@@ -465,15 +557,87 @@ export class StacClient {
         return pending;
     }
 
+    /** The collections endpoint: the landing page's `data` link, else `{url}/collections`. */
+    private get collectionsUrl(): string {
+        return this.link("data") ?? `${this.url}/collections`;
+    }
+
+    /** Reads collection pages from a URL, following `next` links until none, a repeat, or 10000 collections. */
+    private async pageCollections(first: string): Promise<StacCollectionJson[]> {
+        const out: StacCollectionJson[] = [];
+        let url: string | undefined = first;
+        const seen = new Set<string>();
+        while (url && !seen.has(url) && out.length < 10000) {
+            seen.add(url);
+            const page: { collections?: StacCollectionJson[]; links?: StacLink[] } = await this.json(url);
+            out.push(...(page.collections ?? []));
+            url = page.links?.find((l) => l.rel === "next")?.href;
+        }
+        return out;
+    }
+
+    /** Pages of {@link COLLECTION_PAGE_SIZE} from a URL; a server that refuses the limit (HTTP 400) is asked without it. */
+    private pageCollectionsLarge(url: URL): Promise<StacCollectionJson[]> {
+        const large = new URL(url);
+        large.searchParams.set("limit", String(COLLECTION_PAGE_SIZE));
+        return this.pageCollections(large.toString()).catch((e: unknown) => {
+            if (e instanceof StacError && e.status === 400) return this.pageCollections(url.toString());
+            throw e;
+        });
+    }
+
+    /** Server collection searches, by URL: moving back to an earlier view or period costs no request. */
+    private readonly _searched = new Map<string, Promise<StacCollectionJson[]>>();
+
+    /** The server step of a filter: the collections the server keeps, or undefined (cannot filter, or failed). */
+    private async serverCollections(filter: CollectionFilter): Promise<StacCollectionJson[] | undefined> {
+        if (filter.server === false || !this.capabilities.collectionSearch || this.capabilities.staticCatalog) return undefined;
+        const url = new URL(this.collectionsUrl);
+        const sent: ServerCollectionSearch["sent"] = [];
+        if (filter.bbox) {
+            url.searchParams.set("bbox", filter.bbox.map((v) => Number(v.toFixed(6))).join(","));
+            sent.push("bbox");
+        }
+        const datetime = datetimeParam(filter.datetime);
+        if (datetime) {
+            url.searchParams.set("datetime", datetime);
+            sent.push("datetime");
+        }
+        if (!sent.length) return undefined;
+        const first = new URL(url);
+        first.searchParams.set("limit", String(COLLECTION_PAGE_SIZE));
+        const key = first.toString();
+        let pending = this._searched.get(key);
+        if (!pending) {
+            pending = this.pageCollectionsLarge(url);
+            this._searched.set(key, pending);
+            const mine = pending;
+            mine.catch(() => { if (this._searched.get(key) === mine) this._searched.delete(key); });
+        }
+        try {
+            const found = await pending;
+            filter.onServer?.({sent, url: key, count: found.length});
+            return found;
+        } catch (e) {
+            filter.onServer?.({sent, url: key, error: e instanceof Error ? e.message : String(e)});
+            return undefined;
+        }
+    }
+
     /**
-     * Collections whose extent overlaps a bbox and an interval, and whose text matches `q` (client side).
+     * Collections whose extent overlaps a bbox and an interval, and whose text matches `q`.
      *
-     * Filters the result of {@link StacClient.listCollections}. Collections without a spatial or temporal extent
-     * pass the corresponding test. Boxes whose west edge is greater than their east edge cross the antimeridian,
-     * for the filter and for the collections' extents alike. `q` matches case-insensitively as a substring of the
-     * id, title, description or a keyword.
+     * Two steps, with the same filter. When the server declares STAC Collection Search (and `server` is not false),
+     * the bbox and the interval are sent to its `/collections` first; then every test is applied here, to what the
+     * server returned or, without a server step (or when it failed), to {@link StacClient.listCollections}. A server
+     * that filters loosely, or ignores a parameter, thus gives the same result as one that filters exactly; a
+     * server step only saves downloading. See {@link CollectionFilter} for each test.
      *
-     * @param filter What to match; every part is optional and an empty filter returns all collections.
+     * Collections without a spatial or temporal extent pass the corresponding test. Boxes whose west edge is greater
+     * than their east edge cross the antimeridian, for the filter and for the collections' extents alike. `q`
+     * matches case-insensitively as a substring of the id, title, description or a keyword.
+     *
+     * @param filter What to keep; every part is optional and an empty filter returns all collections.
      * @returns A promise of the matching collections JSON.
      * @throws {@link StacError} (the promise rejects) when the collections cannot be listed.
      * @example
@@ -481,26 +645,21 @@ export class StacClient {
      * const searchText = "sentinel"; // text the user typed
      * const found = await client.findCollections({
      *     bbox: [-10, 35, 5, 44],
-     *     datetime: ["2024-01-01T00:00:00Z", null],
+     *     datetime: ["2024-01-01", "2024-12-31"],
      *     q: searchText,
+     *     regional: true,
+     *     onServer: (step) => console.log(`the server kept ${step.count} collection(s)`),
      * });
      * ```
      */
-    async findCollections(filter: {
-        /** Area of interest `[west, south, east, north]` in longitude/latitude (`west > east` crosses the antimeridian). */
-        bbox?: Bbox;
-        /** Interval `[start, end]` as RFC 3339 (or anything `Date.parse` reads), null for an open end. */
-        datetime?: [string | null, string | null];
-        /** Text to look for in the id, title, description and keywords (case-insensitive). */
-        q?: string;
-    } = {}): Promise<StacCollectionJson[]> {
-        const all = await this.listCollections();
-        const t0 = filter.datetime?.[0] ? Date.parse(filter.datetime[0]) : -Infinity;
-        const t1 = filter.datetime?.[1] ? Date.parse(filter.datetime[1]) : Infinity;
-        const q = filter.q?.toLowerCase();
+    async findCollections(filter: CollectionFilter = {}): Promise<StacCollectionJson[]> {
+        const all = await this.serverCollections(filter) ?? await this.listCollections();
+        const [t0, t1] = intervalMs(filter.datetime);
+        const q = filter.q?.trim().toLowerCase();
         return all.filter((c) => {
             const d = describe(c);
             if (filter.bbox && d.bbox && !bboxesIntersect(filter.bbox, d.bbox)) return false;
+            if (filter.regional && d.bbox && isGlobalBbox(d.bbox)) return false;
             const i0 = d.interval[0] ? Date.parse(d.interval[0]) : -Infinity, i1 = d.interval[1] ? Date.parse(d.interval[1]) : Infinity;
             if (i0 > t1 || i1 < t0) return false;
             if (q && ![c.id, c.title, c.description, ...(c.keywords ?? [])].some((t) => t?.toLowerCase().includes(q))) return false;
@@ -620,10 +779,10 @@ export class StacClient {
      * Step 1 of the workflow: the collections that overlap an area and a period and whose text matches `q`,
      * summarised for choosing (extent, bands, filterable properties).
      *
-     * Filters the result of {@link StacClient.listCollections} (client side). Collections without a spatial or
-     * temporal extent pass the corresponding test. The area's bbox is compared with each collection's bbox (the test
-     * of {@link bboxesIntersect}); a collection bbox crossing the antimeridian (`west > east`) is handled. The list is
-     * read once and cached, so calling this again with another filter (the view moved) makes no requests.
+     * The filter of {@link StacClient.findCollections}, with the area given as a bbox or a GeoJSON (multi)polygon
+     * (its bbox is what is compared): the server filters first when it declares STAC Collection Search, then every
+     * test runs here. Without a server step the full list is read once and cached, so calling this again with
+     * another filter makes no requests; server steps are cached by URL.
      *
      * @param filter What to match; every part is optional and an empty filter returns all collections.
      * @returns A promise of the collection summaries, in server order.
@@ -633,27 +792,25 @@ export class StacClient {
      * const catalogUrl = ...;   // the STAC API URL the user entered
      * const area = ...;         // [west, south, east, north] the user drew
      * const catalog = await StacClient.connect(catalogUrl);
-     * const collections = await catalog.collections({area, datetime: ["2024-01-01", null]});
+     * const collections = await catalog.collections({area, datetime: ["2024-01-01", null], regional: true});
      * for (const c of collections) console.log(c.id, c.title, c.bands.join(", "));
      * ```
      */
-    async collections(filter: {
+    async collections(filter: Omit<CollectionFilter, "bbox"> & {
         /** Area of interest: `[west, south, east, north]` or a GeoJSON (multi)polygon, in longitude/latitude. */
         area?: AreaBbox | GeoJsonArea;
-        /** Interval `[start, end]` as RFC 3339 (or anything `Date.parse` reads), null for an open end. */
-        datetime?: [string | null, string | null];
-        /** Text to look for in the id, title, description and keywords (case-insensitive). */
-        q?: string;
         /**
          * Ids of collections to keep whatever the other tests say, for example the collection the user pasted or
-         * chose before, so it stays in the list when "only collections covering the view" is ticked.
+         * chose before, so it stays in the list when "only collections in the map view" is ticked.
          */
         include?: string[];
     } = {}): Promise<CollectionSummary[]> {
-        const found = await this.findCollections({bbox: filter.area ? bboxOf(filter.area) : undefined, datetime: filter.datetime, q: filter.q});
-        const include = new Set(filter.include ?? []);
-        const all = include.size ? await this.listCollections() : found;
-        return all.filter((c) => include.has(c.id) || found.includes(c)).map((c) => summarise(describe(c)));
+        const {area, include: kept, ...rest} = filter;
+        const found = await this.findCollections({...rest, bbox: area ? bboxOf(area) : undefined});
+        const include = new Set(kept ?? []);
+        const missing = [...include].filter((id) => !found.some((c) => c.id === id));
+        const extra = missing.length ? (await this.listCollections()).filter((c) => missing.includes(c.id)) : [];
+        return [...found, ...extra].map((c) => summarise(describe(c)));
     }
 
     /**
@@ -705,8 +862,8 @@ export class StacClient {
      *
      * 1. Reads the collection with {@link StacClient.collection} (collection JSON and queryables) and checks the
      *    selection with {@link StacClient.check}. Errors reject; warnings are returned in `problems`.
-     * 2. Searches with `area`, `datetime`, `where` and `maxCloud`, 100 items per page, until `maxItems` (default
-     *    300) items or the last page. The filters are compiled for the server, see {@link StacClient.plan}.
+     * 2. Searches with `area`, `datetime`, `where` and `maxCloud`, {@link SELECT_PAGE_SIZE} (1000) items per page,
+     *    until `maxItems` (default {@link SELECT_MAX_ITEMS}, 400) items or the last page. The filters are compiled for the server, see {@link StacClient.plan}.
      * 3. Applies `pick` (see {@link Pick}): `months`, then `coverage` (with an area), then `per` or `rank`. When
      *    the result can hold several items (`per`, or a mosaic of `coverage: "best"`), only the candidates of one
      *    coordinate reference are used; the others are listed in {@link StacSelectionResult.dropped}.
@@ -1266,12 +1423,14 @@ export class StacSearch {
         let index = 0, scanned = 0, kept = 0;
         this._rejected = {};
         const batch = this.request.limit ?? this.client.options.pageSize ?? 50;
-        for await (const read of crawlItems(this.client, roots, {batch, maxScanned, signal: this.signal})) {
+        const stats = {pruned: 0};
+        const area = this.request.area ? bboxOf(this.request.area) : undefined;
+        for await (const read of crawlItems(this.client, roots, {batch, maxScanned, signal: this.signal, area, stats})) {
             if (this.signal?.aborted) throw this.signal.reason;
             scanned += read.length;
             const pageItems = read.filter((i) => safeMatches(i, this.request, {}) || (this.reject(i, {}), false)).slice(0, maxItems - kept);
             kept += pageItems.length;
-            this.onProgress?.({step: "search", pages: index + 1, scanned, kept});
+            this.onProgress?.({step: "search", pages: index + 1, scanned, kept, ...(stats.pruned ? {pruned: stats.pruned} : {})});
             yield {items: pageItems, index: index++, returned: read.length, scanned, plan: this._plan, footprints: () => itemFootprints(pageItems)};
             if (kept >= maxItems || scanned >= maxScanned) return;
         }

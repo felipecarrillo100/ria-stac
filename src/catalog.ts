@@ -41,6 +41,8 @@ export interface CollectionSummary {
     bandNaming: "common-names" | "asset-keys" | "none";
     /** Keywords of the collection, when declared. */
     keywords?: string[];
+    /** Longer description (CommonMark), when given: free text to search in. */
+    description?: string;
 }
 
 /** A collection in detail, see {@link StacClient.collection}: the summary plus queryables, assets and the JSON.
@@ -98,8 +100,11 @@ export interface StacSelection {
      */
     maxCloud?: number;
     /**
-     * Stop the search after this many items. Default 300. {@link StacClient.select} requests 100 items per page
-     * (the server or the profile may lower it), so 300 items cost about 3 requests. `select` counts only items
+     * Stop the search after this many items: a whole number from 1 to {@link SELECT_MAX_ITEMS_LIMIT} (1000), else
+     * {@link StacClient.check} reports an error and {@link StacClient.select} rejects. Default {@link SELECT_MAX_ITEMS} (400). {@link StacClient.select}
+     * requests {@link SELECT_PAGE_SIZE} items per page (the server or the profile may lower it), so 400 items cost
+     * one request where the server allows it. More items give the pick more to choose from, and take longer to
+     * read and to score. `select` counts only items
      * with an asset in one of `formats`: it skips the others (zipped or vector downloads, see `skipped`) and reads
      * on, up to `maxScanned` items in all.
      */
@@ -325,7 +330,7 @@ export function summarise(d: CollectionDescription): CollectionSummary {
         id: d.id, title: d.title, bbox: d.bbox, interval: d.interval, bands: collectionBands(d), properties: Object.keys(d.summaries),
         bandNaming: d.assets.some((a) => a.bands.some((b) => b.commonName !== undefined)) ? "common-names"
             : d.assets.length ? "asset-keys" : "none",
-        keywords: d.keywords,
+        keywords: d.keywords, description: d.description,
     };
 }
 
@@ -339,6 +344,10 @@ export function summarise(d: CollectionDescription): CollectionSummary {
 export function checkSelection(selection: StacSelection, collection: CollectionDetails | undefined): RiaGeoTiffProblem[] {
     const problems: RiaGeoTiffProblem[] = [];
     if (!collection) return [{path: "collection", severity: "error", message: `the catalog has no collection "${selection.collection}"`}];
+    const max = selection.maxItems;
+    if (max !== undefined && !(Number.isInteger(max) && max >= 1 && max <= SELECT_MAX_ITEMS_LIMIT)) {
+        problems.push({path: "maxItems", severity: "error", message: `must be a whole number from 1 to ${SELECT_MAX_ITEMS_LIMIT}; got ${max}`});
+    }
     if (selection.area && collection.bbox && !bboxesIntersect(bboxOf(selection.area), collection.bbox)) {
         problems.push({path: "area", severity: "error", message: `outside the collection's extent ${collection.bbox.map((v) => v.toFixed(2)).join(", ")}`});
     }
@@ -403,7 +412,7 @@ export function rankOf(rank: Pick["rank"]): (i: StacItemJson) => number {
  * The search request {@link StacClient.select} sends for a selection, for listing every item it would consider
  * ("all items found, no pick") with the same filters: the collection, `area`, `datetime`, `where`, `filter` and `maxCloud`
  * (as `where: {"eo:cloud_cover": {lt: maxCloud}}`, merged with `where`), 100 items per page, up to `maxItems`
- * (default 300). `bands` and `pick` are not part of the search.
+ * (default {@link SELECT_MAX_ITEMS}, 400). `bands` and `pick` are not part of the search.
  *
  * @param selection The selection.
  * @returns A new request for {@link StacClient.search}.
@@ -421,9 +430,27 @@ export function selectionToRequest(selection: StacSelection): StacSearchRequest 
         collections: [selection.collection], ...(selection.area ? {area: selection.area} : {}),
         ...(selection.datetime !== undefined ? {datetime: selection.datetime} : {}),
         ...(Object.keys(where).length ? {where} : {}), ...(selection.filter !== undefined ? {filter: selection.filter} : {}),
-        limit: 100, maxItems: selection.maxItems ?? 300,
+        limit: 100, maxItems: selection.maxItems ?? SELECT_MAX_ITEMS,
     };
 }
+
+/**
+ * How many items in the chosen formats {@link StacClient.select} finds at most by default (see
+ * {@link StacSelection.maxItems}): 400. The search stops there, so a selection matching more (a whole-world search,
+ * a long period) is picked among the first 400 in the server's order.
+ *
+ * @category Choosing data
+ */
+export const SELECT_MAX_ITEMS = 400;
+
+/**
+ * The largest {@link StacSelection.maxItems} a selection accepts: 1000. Picking scores every item found, so the
+ * bound keeps a selection quick; to list more, page through {@link StacClient.search} with
+ * {@link selectionToRequest}.
+ *
+ * @category Choosing data
+ */
+export const SELECT_MAX_ITEMS_LIMIT = 1000;
 
 /**
  * How many items {@link StacClient.select} reads at most by default (see {@link StacSelection.maxScanned}),
@@ -473,7 +500,7 @@ export async function selectItems(client: StacClient, selection: StacSelection &
             [...problems, {path: "formats", severity: "error", message}]);
     }
     const wanted = cql2Predicate(formatsFilter(formats));
-    const limit = selection.maxItems ?? 300;
+    const limit = selection.maxItems ?? SELECT_MAX_ITEMS;
     const maxScanned = selection.maxScanned ?? SELECT_SCAN_LIMIT;
     const request = {...selectionToRequest(selection), limit: SELECT_PAGE_SIZE, maxItems: maxScanned, maxScanned};
     let last: StacProgress = {step: "search", pages: 0, scanned: 0, kept: 0};

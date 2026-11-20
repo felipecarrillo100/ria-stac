@@ -1,6 +1,6 @@
 import {fromText} from "ogc-cql2/parse";
 import {afterEach, describe, expect, it, vi} from "vitest";
-import {SELECT_PAGE_SIZE, 
+import {COLLECTION_PAGE_SIZE, isGlobalBbox, SELECT_PAGE_SIZE, 
     assetBands, bestPerPeriod, coverArea, dedupeItems, emptyProfile, evaluateCql2, groupItems, itemBandNames,
     itemsCovering, normaliseDatetime, parseCapabilities, planetaryComputerSigner, planSearch, resolveAsset, sortItems,
     StacClient, StacError, splitFilter, formatsFilter, toBandInputs, toCql2Text, type StacItemJson,
@@ -486,5 +486,183 @@ describe("assets and band inputs", () => {
         const other = item("O", {}, undefined, {B04: {href: "https://mine.blob.core.windows.net/c/B04.tif", type: "image/tiff"}});
         expect(sign.matches("https://mine.blob.core.windows.net/c/B04.tif", other)).toBe(false);
         expect(resolveAsset(other, "B04").readable).toBe("yes");
+    });
+});
+
+// ------------------------------------------------------------------------------------------------ collection filter
+
+describe("collection filter: the server first (Collection Search), then the same tests in the client", () => {
+    const COLLECTION_SEARCH = "https://api.stacspec.org/v1.0.0-rc.1/collection-search";
+    const coll = (id: string, bbox: [number, number, number, number], interval: [string | null, string | null], extra: Record<string, unknown> = {}) => ({
+        type: "Collection", id, stac_version: "1.1.0", description: "", license: "proprietary", links: [],
+        extent: {spatial: {bbox: [bbox]}, temporal: {interval: [interval]}}, ...extra,
+    });
+    const all = [
+        coll("world-dem", [-180, -90, 180, 90], ["2015-01-01T00:00:00Z", null], {keywords: ["elevation"]}),
+        coll("spain-ortho", [-10, 35, 5, 44], ["2020-01-01T00:00:00Z", "2022-12-31T00:00:00Z"]),
+        coll("arizona-lidar", [-115, 31, -109, 37], ["2023-01-01T00:00:00Z", null], {keywords: ["elevation"], title: "Arizona LiDAR"}),
+        coll("sentinel-2-l2a", [-180, -90, 180, 90], ["2017-03-28T00:00:00Z", null]),
+    ];
+    /** A collections endpoint: filters by bbox and datetime unless loose; fails or caps the page size on request. */
+    function collectionsServer(options: { search?: boolean; loose?: boolean; fails?: boolean; maxLimit?: number } = {}) {
+        const base = "https://coll.test/v1";
+        const calls: string[] = [];
+        const json = (status: number, body: unknown) => new Response(JSON.stringify(body), {status, headers: {"Content-Type": "application/json"}});
+        vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+            const url = new URL(String(input));
+            calls.push(url.toString());
+            if (url.pathname === "/v1" || url.pathname === "/v1/") {
+                return json(200, {type: "Catalog", id: "c", stac_version: "1.1.0", links: [{rel: "data", href: `${base}/collections`}],
+                    conformsTo: [C("core"), C("collections"), ...(options.search === false ? [] : [COLLECTION_SEARCH])]});
+            }
+            if (url.pathname !== "/v1/collections") return json(404, {});
+            const p = url.searchParams;
+            if (options.fails && (p.has("bbox") || p.has("datetime"))) return json(500, {code: "PostgresSyntaxError"});
+            if (options.maxLimit && Number(p.get("limit") ?? 10) > options.maxLimit) return json(400, {detail: "limit too large"});
+            let found = all;
+            if (!options.loose && p.has("bbox")) {
+                const [w, so, e, n] = p.get("bbox")!.split(",").map(Number);
+                found = found.filter((c) => { const [cw, cs, ce, cn] = c.extent.spatial.bbox[0]; return cw <= e && ce >= w && cs <= n && cn >= so; });
+            }
+            if (!options.loose && p.has("datetime")) {
+                const [a, b] = p.get("datetime")!.split("/").map((t) => (t === ".." ? NaN : Date.parse(t)));
+                found = found.filter((c) => {
+                    const [i0, i1] = c.extent.temporal.interval[0].map((t) => (t ? Date.parse(t) : NaN));
+                    return !(i0 > b) && !(i1 < a);
+                });
+            }
+            return json(200, {collections: found, links: []});
+        }));
+        return {base, calls};
+    }
+    const ids = (cs: { id: string }[]) => cs.map((c) => c.id).sort();
+    const arizona: [number, number, number, number] = [-112.5, 36, -111.8, 36.4];
+
+    it("sends the bbox and the period (never q) with a large limit, then tests everything again", async () => {
+        const {base, calls} = collectionsServer();
+        const client = await StacClient.connect(base);
+        const steps: unknown[] = [];
+        const found = await client.collections({area: arizona, datetime: ["2024-01-01", null], q: "elev", onServer: (s) => steps.push(s)});
+        expect(ids(found)).toEqual(["arizona-lidar", "world-dem"]);
+        const sent = new URL(calls.find((u) => u.includes("bbox="))!);
+        expect(sent.searchParams.get("bbox")).toBe("-112.5,36,-111.8,36.4");
+        expect(sent.searchParams.get("datetime")).toBe("2024-01-01T00:00:00.000Z/..");
+        expect(sent.searchParams.get("limit")).toBe(String(COLLECTION_PAGE_SIZE));
+        expect(sent.searchParams.has("q")).toBe(false);
+        expect(steps).toEqual([{sent: ["bbox", "datetime"], url: sent.toString(), count: 3}]);
+        // The full list was never read.
+        expect(calls.some((u) => u === `${base}/collections`)).toBe(false);
+        // The full list, when needed, comes in large pages too.
+        await client.listCollections();
+        expect(calls).toContain(`${base}/collections?limit=${COLLECTION_PAGE_SIZE}`);
+        // Regional drops the whole-world collections.
+        expect(ids(await client.collections({area: arizona, regional: true}))).toEqual(["arizona-lidar"]);
+    });
+
+    it("gives the same list when the server ignores the parameters, cannot filter, or fails", async () => {
+        const filter = {area: arizona, datetime: ["2024-01-01", null] as [string, null], regional: true};
+        const expected = ["arizona-lidar"];
+        for (const options of [{loose: true}, {search: false}, {fails: true}]) {
+            const {base, calls} = collectionsServer(options);
+            const client = await StacClient.connect(base);
+            const steps: { error?: string; count?: number }[] = [];
+            expect(ids(await client.collections({...filter, onServer: (s) => steps.push(s)}))).toEqual(expected);
+            if (options.search === false) {
+                expect(steps).toEqual([]);
+                expect(calls.some((u) => u.includes("limit="))).toBe(false);
+                expect(calls.some((u) => u.includes("bbox="))).toBe(false);
+            }
+            if (options.fails) expect(steps[0].error).toMatch(/500/);
+            if (options.loose) expect(steps[0].count).toBe(4);
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it("asks again without limit when the server refuses it, and caches each answer", async () => {
+        const {base, calls} = collectionsServer({maxLimit: 100});
+        const client = await StacClient.connect(base);
+        expect(ids(await client.collections({area: arizona}))).toEqual(["arizona-lidar", "sentinel-2-l2a", "world-dem"]);
+        const searches = () => calls.filter((u) => u.includes("bbox=")).length;
+        expect(searches()).toBe(2);
+        await client.collections({area: arizona, q: "lidar"});
+        expect(searches()).toBe(2);
+    });
+
+    it("reads a date-only end as the end of that day; tells global extents from regional ones", async () => {
+        collectionsServer({search: false});
+        const client = await StacClient.connect("https://coll.test/v1");
+        // arizona-lidar starts 2023-01-01T00:00Z: inside a period ending on that date.
+        expect(ids(await client.findCollections({datetime: [null, "2023-01-01"]}))).toContain("arizona-lidar");
+        expect(ids(await client.findCollections({datetime: [null, "2022-12-31"]}))).not.toContain("arizona-lidar");
+        expect(isGlobalBbox([-180, -90, 180, 90])).toBe(true);
+        expect(isGlobalBbox([-180, -60, 180, 84])).toBe(true);
+        expect(isGlobalBbox([-180, 0, 180, 90])).toBe(false);
+        expect(isGlobalBbox([170, -90, -170, 90])).toBe(false);
+    });
+});
+
+// ------------------------------------------------------------------------------------------------ static crawl by area
+
+describe("static catalog search: parts outside the area are not read", () => {
+    const base = "https://tiles.test";
+    const box = (b: number[]) => `box:${b.join(",")}`;
+    const feature = (id: string, b: [number, number, number, number]) => ({...item(id, {}, b), collection: "tiles", links: []});
+    const docs: Record<string, unknown> = {
+        "/catalog.json": {type: "Catalog", id: "root", stac_version: "1.0.0", description: "", links: [{rel: "child", href: "./c/collection.json"}]},
+        "/c/collection.json": {type: "Collection", id: "tiles", stac_version: "1.0.0", description: "", license: "proprietary",
+            extent: {spatial: {bbox: [[-180, -90, 180, 90]]}, temporal: {interval: [[null, null]]}},
+            links: [
+                {rel: "child", href: "./p0_p0/catalog.json", title: box([0, 0, 10, 10])},
+                {rel: "child", href: "./p0_p10/catalog.json", title: box([10, 0, 20, 10])},
+                {rel: "child", href: "./p10_p0/catalog.json", title: box([0, 10, 10, 20])},
+                // No title to read: followed, then skipped for its declared extent.
+                {rel: "child", href: "./far/collection.json"},
+            ]},
+        "/c/p0_p0/catalog.json": {type: "Catalog", id: "p0_p0", stac_version: "1.0.0", description: "",
+            links: [{rel: "item", href: "./a.json", title: box([2, 2, 3, 3])}, {rel: "item", href: "./b.json", title: box([5, 5, 6, 6])}]},
+        "/c/p0_p10/catalog.json": {type: "Catalog", id: "p0_p10", stac_version: "1.0.0", description: "", links: [{rel: "item", href: "./c.json"}]},
+        "/c/p10_p0/catalog.json": {type: "Catalog", id: "p10_p0", stac_version: "1.0.0", description: "", links: [{rel: "item", href: "./d.json"}]},
+        "/c/far/collection.json": {type: "Collection", id: "far", stac_version: "1.0.0", description: "", license: "proprietary",
+            extent: {spatial: {bbox: [[100, 50, 110, 60]]}, temporal: {interval: [[null, null]]}}, links: [{rel: "item", href: "./e.json"}]},
+        "/c/p0_p0/a.json": feature("a", [2, 2, 3, 3]),
+        "/c/p0_p0/b.json": feature("b", [5, 5, 6, 6]),
+        "/c/p0_p10/c.json": feature("c", [12, 2, 13, 3]),
+        "/c/p10_p0/d.json": feature("d", [2, 12, 3, 13]),
+        "/c/far/e.json": feature("e", [101, 51, 102, 52]),
+    };
+    function serve() {
+        const calls: string[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+            const path = new URL(String(input)).pathname;
+            calls.push(path);
+            const doc = docs[path];
+            return new Response(JSON.stringify(doc ?? {}), {status: doc ? 200 : 404, headers: {"Content-Type": "application/json"}});
+        }));
+        return calls;
+    }
+    const linkBbox = (link: { title?: string }) => (link.title?.startsWith("box:") ? link.title.slice(4).split(",").map(Number) as [number, number, number, number] : undefined);
+
+    it("skips links whose crawl.linkBbox misses the area, and children whose extent does", async () => {
+        const calls = serve();
+        const client = await StacClient.connect(`${base}/catalog.json`, {crawl: {linkBbox}});
+        // Listing the collections reads every child once (nested collections may hide anywhere); it is cached.
+        await client.listCollections();
+        calls.length = 0;
+        const progress: number[] = [];
+        const found = await client.search({collections: ["tiles"], area: [2.2, 2.2, 2.8, 2.8]}, {onProgress: (p) => progress.push(p.pruned ?? 0)}).collect();
+        expect(found.map((i) => i.id)).toEqual(["a"]);
+        for (const unread of ["/c/p0_p10/catalog.json", "/c/p10_p0/catalog.json", "/c/p0_p0/b.json", "/c/far/e.json"]) expect(calls).not.toContain(unread);
+        // Two sub-catalogs and one item by their link, the far collection by its extent.
+        expect(Math.max(...progress)).toBe(4);
+    });
+
+    it("finds the same items without linkBbox, reading everything but the far collection's items", async () => {
+        const calls = serve();
+        const client = await StacClient.connect(`${base}/catalog.json`);
+        expect((await client.search({collections: ["tiles"], area: [2.2, 2.2, 2.8, 2.8]}).collect()).map((i) => i.id)).toEqual(["a"]);
+        expect(calls).toContain("/c/p0_p10/c.json");
+        expect(calls).not.toContain("/c/far/e.json");
+        // Without an area nothing is skipped.
+        expect((await client.search({collections: ["tiles"]}).collect()).map((i) => i.id).sort()).toEqual(["a", "b", "c", "d", "e"]);
     });
 });
