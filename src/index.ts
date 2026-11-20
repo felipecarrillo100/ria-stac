@@ -28,6 +28,8 @@ export {bestPerPeriod, coverArea, dedupeItems, defaultScore, groupItems, itemFoo
 export type {Period} from "./select.js";
 export {DEFAULT_SIGNERS, isPlanetaryComputerItem, isPlanetaryComputerUrl, planetaryComputerSigner, resolveAsset} from "./assets.js";
 export type {AssetSigner, ResolvedAsset} from "./assets.js";
+export {nameBands, resolveBandName, stableAssetKey} from "./naming.js";
+export type {BandNameSource, NamedAsset, NamedBand, ResolvedBandName} from "./naming.js";
 export {assetBands, assetFormat, isDataAsset, itemFormats, isGeoTiffAsset, type AssetFormat} from "./bands.js";
 export type {BandDescriptor} from "./bands.js";
 export {bboxesIntersect, bboxOf, coverageOf, footprintOf, intersectsArea, isGlobalBbox} from "./geometry.js";

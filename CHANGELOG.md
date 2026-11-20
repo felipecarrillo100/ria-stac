@@ -2,6 +2,22 @@
 
 ## 0.1.0 (unreleased)
 
+### Band naming (2026-11-20)
+
+- Band naming (evidence: `spikes/BAND-NAMING.md` of ria-stac, nine real collections): names stay roles first (EO
+  common name when unique, else the asset key), which keeps styles portable across catalogs. New:
+  - Keys lose the item's id before naming (`stableAssetKey`): swisstopo's per-tile keys
+    (`swissalti3d_2019_2598-1198_0.5_2056_5728.tif`) gave every tile its own band; now the tiles of a mosaic share
+    one band per resolution (SWISSIMAGE: 6 tiles, 2 bands instead of 12).
+  - Aliases (`nameBands`, `resolveBandName`): each band also answers to its asset key, band name and common name, so a
+    style naming `B04` or `OLI_B4` finds `red`; resolving through an alias is reported. A common name several bands
+    share (`rededge`) is no alias.
+  - Each name says where it comes from (`BandNameSource`).
+  - A multiband band whose name a single-band asset already has gets the asset key as a prefix (Planetary
+    Computer's `visual` gives `visual_red`, not a second `red`).
+  - The rule is in `naming.ts`, identical in ria-stac and ria-geotiff, tested by both on the shared fixtures of real
+    items `test/fixtures/band-naming.json`.
+
 ### Fixed and changed after the implementation review (2026-11-20)
 
 Evidence: the STAC API specifications, the code of other clients and servers, and live runs on Earth Search,
