@@ -146,6 +146,21 @@ export function planetaryComputerSigner(endpoint = "https://planetarycomputer.mi
 export const DEFAULT_SIGNERS: AssetSigner[] = [planetaryComputerSigner()];
 
 /**
+ * Whether an asset lives on requester-pays storage: the storage extension v2 (`storage:refs` naming schemes of the
+ * item's `storage:schemes` with `requester_pays: true`), v1 (`storage:requester_pays`), or a scheme reference that
+ * says "requester" when its scheme is not in the item (declared on the collection).
+ */
+function requesterPays(asset: StacAssetJson, item: StacItemJson): boolean {
+    if (asset["storage:requester_pays"] === true) return true;
+    const refs = asset["storage:refs"];
+    const schemes = item.properties["storage:schemes"] as Record<string, { requester_pays?: boolean }> | undefined;
+    if (Array.isArray(refs) && schemes && typeof schemes === "object") {
+        return refs.some((r) => typeof r === "string" && schemes[r]?.requester_pays === true);
+    }
+    return /requester/i.test(JSON.stringify(refs ?? ""));
+}
+
+/**
  * A readable URL for an asset: its href when https, else an https alternate, else an http one; signed by the first
  * matching signer. `readable` says what to expect: "no" for s3:// without an http(s) alternate, for requester-pays
  * storage, and for an http-only asset when the page is served over https (`reason` `"mixed content"`: browsers
@@ -180,7 +195,7 @@ export const DEFAULT_SIGNERS: AssetSigner[] = [planetaryComputerSigner()];
 export function resolveAsset(item: StacItemJson, key: string, signers: AssetSigner[] = DEFAULT_SIGNERS): ResolvedAsset {
     const asset: StacAssetJson | undefined = item.assets[key];
     if (!asset) throw new RangeError(`Item ${item.id} has no asset "${key}"`);
-    const bands = assetBands(asset);
+    const bands = assetBands(asset, item);
     // Relative hrefs (static catalogs) resolve against the item's own URL, its self link.
     const self = item.links?.find((l) => l.rel === "self")?.href;
     const absolute = (h: string) => {
@@ -190,7 +205,7 @@ export function resolveAsset(item: StacItemJson, key: string, signers: AssetSign
     const candidates = [asset.href, ...Object.values(asset.alternate ?? {}).map((a) => a.href)].filter((h) => typeof h === "string").map(absolute);
     const href = candidates.find((h) => /^https:\/\//i.test(h)) ?? candidates.find((h) => /^http:\/\//i.test(h));
     if (!href) {
-        const reason = asset["storage:requester_pays"] || /requester/i.test(JSON.stringify(asset["storage:refs"] ?? "")) ? "requester-pays storage" : `no https URL (${asset.href.split(":")[0]})`;
+        const reason = requesterPays(asset, item) ? "requester-pays storage" : `no https URL (${asset.href.split(":")[0]})`;
         return {key, href: asset.href, readable: "no", reason, bands};
     }
     // An https page cannot read http URLs: browsers block them as mixed content.

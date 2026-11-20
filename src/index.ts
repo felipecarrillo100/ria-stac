@@ -8,8 +8,8 @@
  * resolve and sign assets ({@link resolveAsset}). Everything is plain STAC JSON in and out: the items found go to
  * the library that opens their assets, for example ria-geotiff for Cloud Optimized GeoTIFFs.
  *
- * Requests carry LuciadRIA's `credentials`, `requestHeaders` and `requestParameters`, sent only to the origin they
- * were given for.
+ * Requests carry `credentials`, `requestHeaders` and `requestParameters` ({@link HttpRequestOptions}, the same shape
+ * as LuciadRIA's), sent only to the origin they were given for. ria-stac has no dependency on LuciadRIA.
  *
  * @packageDocumentation
  * @module ria-stac
@@ -33,7 +33,7 @@ export type {BandDescriptor} from "./bands.js";
 export {bboxesIntersect, bboxOf, coverageOf, footprintOf, intersectsArea, isGlobalBbox} from "./geometry.js";
 export {RiaStacError} from "./errors.js";
 export type {RiaStacProblem} from "./errors.js";
-export type {AccessHook, AccessKind, RiaStacRequest, RiaStacRequestListener} from "./http.js";
+export type {AccessHook, AccessKind, HttpRequestHeaders, HttpRequestOptions, HttpRequestParameters, RiaStacRequest, RiaStacRequestListener} from "./http.js";
 export type {Bbox, GeoJsonArea, StacAssetJson, StacCatalogJson, StacCollectionJson, StacItemCollectionJson, StacItemJson, StacLink} from "./json.js";
 export {collectionBands, elevationHint, SELECT_MAX_ITEMS, SELECT_MAX_ITEMS_LIMIT, SELECT_PAGE_SIZE, SELECT_SCAN_LIMIT, selectionToRequest} from "./catalog.js";
 export type {CollectionDetails, CollectionSummary, Pick, StacCandidate, StacSelection, StacSelectionResult} from "./catalog.js";

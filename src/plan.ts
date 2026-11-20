@@ -51,7 +51,11 @@ export interface StacSearchRequest {
     filter?: Cql2Json;
     /** Raw Query extension object (power users). */
     query?: Record<string, Record<string, unknown>>;
-    /** Free-text search terms. Dropped when the server does not support free-text search. */
+    /**
+     * Free-text search: terms separated by spaces or commas (any matches) for basic free-text search, or one
+     * expression for advanced free-text search (`"sentinel AND (cloud OR haze)"`). Dropped when the server does not
+     * support free-text search. Servers match whole words: `"sent"` does not find "Sentinel".
+     */
     q?: string;
     /** Sort order, most significant first. Dropped (with a `sort-dropped` degradation) when the server cannot sort. */
     sortby?: {
@@ -431,7 +435,9 @@ export function planSearch(
     const serverApplies: string[] = [];
     const clientApplies: string[] = [];
     const exclude = new Set(options.exclude ?? []);
-    const postAllowed = options.method !== "GET" && !profile.postToGet;
+    // POST when allowed: not forced to GET, not refused before (405), and declared by the search links (or none is).
+    const postAllowed = options.method !== "GET" && !profile.postToGet
+        && (options.method === "POST" || !caps.searchMethods || caps.searchMethods.includes("POST"));
     const body: Record<string, unknown> = {};
 
     if (request.collections?.length) { body.collections = request.collections; serverApplies.push("collections"); }
@@ -532,7 +538,11 @@ export function planSearch(
         else degradations.push({kind: "fields-dropped"});
     }
     if (request.q) {
-        if (caps.freeText) { body.q = request.q; serverApplies.push("q"); }
+        // Basic free-text takes a list of terms (an array in POST, a comma list in GET); advanced takes one string.
+        if (caps.freeText) {
+            body.q = caps.freeTextAdvanced ? request.q : request.q.split(/[\s,]+/).filter(Boolean);
+            serverApplies.push("q");
+        }
         else degradations.push({kind: "q-dropped"});
     }
 
@@ -544,8 +554,9 @@ export function planSearch(
     body.limit = limit;
     Object.assign(body, request.extra ?? {});
 
-    // POST by default (no URL length limits; every server tested accepts it); GET when asked or after a 405.
-    const method: "GET" | "POST" = postAllowed ? "POST" : "GET";
+    // POST by default (no URL length limits); GET when asked, when the server declares only GET, after a 405, and
+    // for CQL2-text, which the Filter extension sends as a GET parameter (stac-fastapi accepts only CQL2-JSON in POST).
+    const method: "GET" | "POST" = postAllowed && encoding !== "cql2-text" ? "POST" : "GET";
     const http: HttpRequestSpec = method === "POST"
         ? {method, url: searchUrl, headers: {"Content-Type": "application/json", Accept: "application/geo+json"}, body}
         : {method, url: withQuery(searchUrl, getParams(body)), headers: {Accept: "application/geo+json"}};

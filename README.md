@@ -1,7 +1,7 @@
 # ria-stac
 
-STAC client for LuciadRIA applications: STAC APIs and static catalogs, collection filters, item search and picking
-with CQL2, with credentials sent only to the origins they belong to.
+STAC client for web map applications, made for LuciadRIA: STAC APIs and static catalogs, collection filters, item
+search and picking with CQL2, with credentials sent only to the origins they belong to.
 
 ria-stac finds data. It returns plain STAC JSON (collections, items, assets), and another library opens the assets:
 [ria-geotiff](https://github.com/felipecarrillo100/geotifftilesetmodel) for Cloud Optimized GeoTIFFs. The two do not
@@ -10,11 +10,11 @@ depend on each other: the application passes items from one to the other.
 ## Install
 
 ```bash
-npm install ria-stac @luciad/ria
+npm install ria-stac
 ```
 
-`@luciad/ria` is a peer dependency used for its types only (`HttpRequestOptions`): ria-stac contains no LuciadRIA
-code, and none of it runs at run time.
+ria-stac has no dependency on LuciadRIA. Its `HttpRequestOptions` (`credentials`, `requestHeaders`,
+`requestParameters`) has the same shape as LuciadRIA's, so an application passes the same objects to both.
 
 ## Workflow
 
@@ -47,13 +47,14 @@ const found = await client.select({
 
 ## Protected data
 
-Every request carries LuciadRIA's `credentials`, `requestHeaders` and `requestParameters` (`HttpRequestOptions`).
+Every request carries `credentials`, `requestHeaders` and `requestParameters` (`HttpRequestOptions`, the same shape
+as LuciadRIA's).
 They are sent only to the origin of the URL they were given for; a redirect to another origin is refused. An
 `access` hook decides per request instead, for example to return a renewed token.
 
 ## Scripts
 
-`npm run verify` type-checks, tests, builds, checks that no LuciadRIA code is in `lib/`, and lints the package.
+`npm run verify` type-checks, tests, builds and lints the package.
 `npm run docs` writes the API reference to `build/docs`.
 
 ## License

@@ -47,12 +47,16 @@ export const EO_COMMON_NAMES = new Set(["coastal", "blue", "green", "red", "yell
  * The bands of an asset (an empty list when it describes none).
  *
  * Band `i` merges entry `i` of `bands` (STAC 1.1, `eo:` / `raster:` prefixed fields), `eo:bands` and
- * `raster:bands` (STAC 1.0); the first defined value wins in that order. Asset-level `nodata`, `data_type`, `unit`
- * and `gsd` fill fields the bands leave out. Common names outside `EO_COMMON_NAMES` are dropped, numbers given
- * as strings are parsed, and fields without a value are omitted.
+ * `raster:bands` (STAC 1.0); the first defined value wins in that order. Fields the bands leave out are inherited,
+ * as STAC 1.1 common metadata says: from the asset (`nodata`, `data_type`, `unit`, `gsd`, `raster:scale`,
+ * `raster:offset`, `eo:common_name`), then from the item's properties when `item` is given. A single-band asset
+ * that puts these fields on the asset itself, with no band array, gives one band. Common names outside
+ * `EO_COMMON_NAMES` are dropped, numbers given as strings are parsed, and fields without a value are omitted.
  *
  * @param asset A STAC asset (its `href` is not needed).
- * @returns One descriptor per band, as many as the longest of the three band arrays.
+ * @param item The item the asset belongs to, for fields declared once for all its assets. Optional.
+ * @returns One descriptor per band, as many as the longest of the three band arrays (one when only the asset or
+ *   the item describes it; none when nothing does).
  * @example
  * ```ts
  * const item: StacItemJson = searchResult;  // an item returned by a search
@@ -64,12 +68,16 @@ export const EO_COMMON_NAMES = new Set(["coastal", "blue", "green", "red", "yell
  *
  * @category Assets and bands
  */
-export function assetBands(asset: Omit<StacAssetJson, "href">): BandDescriptor[] {
+export function assetBands(asset: Omit<StacAssetJson, "href">, item?: { properties?: Record<string, unknown> }): BandDescriptor[] {
     // STAC 1.1: `bands` with eo:/raster: prefixed fields; 1.0: separate eo:bands and raster:bands arrays.
     const unified = Array.isArray(asset.bands) ? asset.bands : [];
     const eo = Array.isArray(asset["eo:bands"]) ? asset["eo:bands"] : [];
     const raster = Array.isArray(asset["raster:bands"]) ? asset["raster:bands"] : [];
-    const count = Math.max(unified.length, eo.length, raster.length);
+    const a = asset as Record<string, unknown>;
+    const p = (item?.properties ?? {}) as Record<string, unknown>;
+    // Band fields on the asset itself (STAC 1.1 allows them there for a single-band asset): one band.
+    const assetLevel = ["nodata", "data_type", "unit", "raster:scale", "raster:offset", "eo:common_name", "statistics"].some((k) => a[k] !== undefined);
+    const count = Math.max(unified.length, eo.length, raster.length, assetLevel ? 1 : 0);
     const out: BandDescriptor[] = [];
     for (let i = 0; i < count; i++) {
         const u = (unified[i] ?? {}) as Record<string, unknown>;
@@ -78,15 +86,16 @@ export function assetBands(asset: Omit<StacAssetJson, "href">): BandDescriptor[]
         const pick = (...values: unknown[]) => values.find((v) => v !== undefined && v !== null);
         out.push(clean({
             name: str(pick(u.name, e.name, r.name)),
-            commonName: ((c) => (c && EO_COMMON_NAMES.has(c) ? c : undefined))(str(pick(u["eo:common_name"], u.common_name, e.common_name))),
+            commonName: ((c) => (c && EO_COMMON_NAMES.has(c) ? c : undefined))(str(pick(u["eo:common_name"], u.common_name, e.common_name, count === 1 ? a["eo:common_name"] : undefined))),
             centerWavelength: num(pick(u["eo:center_wavelength"], u.center_wavelength, e.center_wavelength)),
-            // eo:bands as the last fallback: some catalogs (INPE BDC) put scale and nodata there.
-            scale: num(pick(u["raster:scale"], u.scale, r.scale, e.scale)),
-            offset: num(pick(u["raster:offset"], u.offset, r.offset, e.offset)),
-            nodata: num(pick(u.nodata, r.nodata, asset.nodata, e.nodata)),
-            dataType: str(pick(u.data_type, r.data_type, asset.data_type, e.data_type)),
-            unit: str(pick(u.unit, r.unit, asset.unit)),
-            resolution: num(pick(u["raster:spatial_resolution"], r.spatial_resolution, u.gsd, asset.gsd)),
+            // eo:bands as the last band-level fallback: some catalogs (INPE BDC) put scale and nodata there; then the
+            // asset, then the item.
+            scale: num(pick(u["raster:scale"], u.scale, r.scale, e.scale, a["raster:scale"], p["raster:scale"])),
+            offset: num(pick(u["raster:offset"], u.offset, r.offset, e.offset, a["raster:offset"], p["raster:offset"])),
+            nodata: num(pick(u.nodata, r.nodata, a.nodata, e.nodata, p.nodata)),
+            dataType: str(pick(u.data_type, r.data_type, a.data_type, e.data_type, p.data_type)),
+            unit: str(pick(u.unit, r.unit, a.unit, p.unit)),
+            resolution: num(pick(u["raster:spatial_resolution"], r.spatial_resolution, u.gsd, a.gsd, p.gsd)),
         }));
     }
     return out;

@@ -6,14 +6,13 @@
 import {assetBands, isDataAsset, type BandDescriptor} from "./bands.js";
 import {emptyProfile, parseCapabilities, type ServerProfile, type StacCapabilities} from "./capabilities.js";
 import type {Bbox, StacCatalogJson, StacCollectionJson, StacItemCollectionJson, StacItemJson, StacLink} from "./json.js";
-import type {HttpRequestHeaders, HttpRequestParameters} from "@luciad/ria/util/HttpRequestOptions.js";
-import {accessFetch, originOf, type AccessHook, type RiaStacRequestListener} from "./http.js";
+import {accessFetch, originOf, type AccessHook, type HttpRequestHeaders, type HttpRequestParameters, type RiaStacRequestListener} from "./http.js";
 import {codeOf, itemMatches, planSearch, type Degradation, type QueryablesSchema, type FilterEncoding, type HttpRequestSpec, type SearchPlan, type StacSearchRequest} from "./plan.js";
 import type {Cql2Json} from "./cql2.js";
 import {bboxesIntersect, bboxOf, isGlobalBbox} from "./geometry.js";
 import {itemFootprints} from "./select.js";
 import type {Bbox as AreaBbox, GeoJsonArea} from "./json.js";
-import {absolutize} from "./links.js";
+import {absolutize, linkHref} from "./links.js";
 import {collectionItemsPlan, crawlCollections, crawlItems, staticPlan} from "./static.js";
 import {checkSelection, selectItems, summarise, type CollectionDetails, type CollectionSummary, type Pick,
     type StacSelection, type StacSelectionResult} from "./catalog.js";
@@ -75,9 +74,14 @@ export interface StacClientOptions {
         statuses?: number[];
         /**
          * Delay before the first retry, in milliseconds, doubled for each further retry. A `Retry-After` header
-         * (seconds) takes precedence. Default 1000.
+         * (seconds or an HTTP date) takes precedence. Default 1000.
          */
         backoffMs?: number;
+        /**
+         * Longest wait a `Retry-After` header may ask for, in milliseconds. A server asking for longer is not
+         * retried: the error says how long it asked to wait. Default 60000.
+         */
+        maxWaitMs?: number;
     };
     /** Timeout of each API request attempt, in milliseconds. Default 30000. */
     timeoutMs?: number;
@@ -106,6 +110,13 @@ export interface StacClientOptions {
          * catalog itself, and the collections a search starts from, must always be readable.
          */
         onError?: "skip" | "throw";
+        /**
+         * Whether listing the collections of a static catalog looks inside collections for more collections. Default
+         * false: the listing stops at a collection, and its children (sub-catalogs, items) are read only when a search
+         * needs them. GEM-15's one collection has 297 sub-catalogs: 2 documents to list it instead of 298. Set true
+         * for catalogs that nest collections inside collections.
+         */
+        nestedCollections?: boolean;
         /**
          * The extent of a linked document, when the application knows it without reading it: called during a search
          * with an area, for every `child` and `item` link of a static catalog (with its href absolute); a link whose
@@ -165,6 +176,22 @@ export interface CollectionDescription {
     }[];
     /** EO common names to asset keys (`{red: "B04"}` or `{red: "red"}`). */
     commonNames: Record<string, string>;
+    /**
+     * An index of all the collection's items in one file, when the collection publishes one: a stac-geoparquet
+     * mirror (an asset with role `collection-mirror` or a parquet media type) or Planetary Computer's
+     * `geoparquet-items` asset. Reading it searches without crawling or paging; this library reports it but does
+     * not read it yet. `href` may need signing (Planetary Computer gives `abfs://` URLs).
+     */
+    itemIndex?: {
+        /** Key of the asset in the collection's `assets`. */
+        key: string;
+        /** Where the file is. */
+        href: string;
+        /** Media type, when declared. */
+        type?: string;
+        /** Asset roles (empty when none are declared). */
+        roles: string[];
+    };
     /** The collection JSON it was made from. */
     raw: StacCollectionJson;
 }
@@ -247,6 +274,28 @@ export class StacError extends RiaStacError {
         this.name = "StacError";
     }
 }
+
+/**
+ * The wait a `Retry-After` header asks for, in milliseconds: delta-seconds or an HTTP date (RFC 9110, 10.2.3);
+ * undefined when absent or unreadable.
+ *
+ * @internal
+ */
+export function retryAfterMs(value: string | null, now = Date.now()): number | undefined {
+    if (!value) return undefined;
+    const text = value.trim();
+    if (/^\d+$/.test(text)) return Number(text) * 1000;
+    const date = Date.parse(text);
+    return Number.isNaN(date) ? undefined : Math.max(0, date - now);
+}
+
+/** How long a page of {@link COLLECTION_PAGE_SIZE} collections may take before the server's default page size is used. */
+const LARGE_PAGE_TIMEOUT_MS = 10_000;
+
+/** The OGC link relation of a queryables document (OGC API - Features Part 3, STAC Filter extension). */
+const QUERYABLES_REL = "http://www.opengis.net/def/rel/ogc/1.0/queryables";
+/** Queryables are JSON Schema: asked for as such, with plain JSON accepted too. */
+const QUERYABLES_ACCEPT = "application/schema+json, application/json;q=0.9";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -436,7 +485,9 @@ export class StacClient {
             conformance = await probe.json<{ conformsTo?: string[] }>(link).then((c) => c.conformsTo, () => undefined);
         }
         const capabilities = parseCapabilities(landing, conformance);
-        if (capabilities.staticCatalog) absolutize(landing, landingUrl);
+        // Relative hrefs (search, data, conformance, children) resolve against the landing page's own URL, for APIs
+        // as for static catalogs: fetch would resolve them against the web page otherwise.
+        absolutize(landing, landingUrl);
         if (landing.type === "Collection" && typeof landing.id === "string") {
             const api = await StacClient.apiOfCollection(landing, landingUrl, url, options);
             if (api) return api;
@@ -563,25 +614,31 @@ export class StacClient {
     }
 
     /** Reads collection pages from a URL, following `next` links until none, a repeat, or 10000 collections. */
-    private async pageCollections(first: string): Promise<StacCollectionJson[]> {
+    private async pageCollections(first: string, timeoutMs?: number): Promise<StacCollectionJson[]> {
         const out: StacCollectionJson[] = [];
         let url: string | undefined = first;
         const seen = new Set<string>();
         while (url && !seen.has(url) && out.length < 10000) {
             seen.add(url);
-            const page: { collections?: StacCollectionJson[]; links?: StacLink[] } = await this.json(url);
+            const page: { collections?: StacCollectionJson[]; links?: StacLink[] } = timeoutMs
+                ? (await this.send({method: "GET", url, headers: {Accept: "application/json"}}, undefined, 1, timeoutMs)).json as never
+                : await this.json(url);
+            for (const c of page.collections ?? []) absolutize(c, url, false);
             out.push(...(page.collections ?? []));
-            url = page.links?.find((l) => l.rel === "next")?.href;
+            url = linkHref(page, "next", url);
         }
         return out;
     }
 
-    /** Pages of {@link COLLECTION_PAGE_SIZE} from a URL; a server that refuses the limit (HTTP 400) is asked without it. */
+    /**
+     * Pages of {@link COLLECTION_PAGE_SIZE} from a URL. A server that refuses the limit (HTTP 400), or does not answer
+     * a large page within {@link LARGE_PAGE_TIMEOUT_MS} (Copernicus once took 33 s), is asked without it.
+     */
     private pageCollectionsLarge(url: URL): Promise<StacCollectionJson[]> {
         const large = new URL(url);
         large.searchParams.set("limit", String(COLLECTION_PAGE_SIZE));
-        return this.pageCollections(large.toString()).catch((e: unknown) => {
-            if (e instanceof StacError && e.status === 400) return this.pageCollections(url.toString());
+        return this.pageCollections(large.toString(), LARGE_PAGE_TIMEOUT_MS).catch((e: unknown) => {
+            if (e instanceof StacError && (e.status === 400 || e.status === undefined)) return this.pageCollections(url.toString());
             throw e;
         });
     }
@@ -691,7 +748,48 @@ export class StacClient {
             return describe(found);
         }
         const cached = (await this._collections?.catch(() => undefined))?.find((c) => c.id === id);
-        return describe(cached?.item_assets ? cached : await this.json<StacCollectionJson>(`${this.url}/collections/${encodeURIComponent(id)}`));
+        return describe(cached?.item_assets ? cached : await this.collectionDoc(id));
+    }
+
+    /** Collection documents read by id, once each (a failure is not cached). */
+    private readonly _collectionDocs = new Map<string, Promise<StacCollectionJson>>();
+
+    /**
+     * The JSON of one collection: `{collections endpoint}/{id}`, where the endpoint is the landing page's `data` link
+     * (else `{url}/collections`). Read once and cached; links and asset hrefs are made absolute.
+     */
+    private collectionDoc(id: string): Promise<StacCollectionJson> {
+        let doc = this._collectionDocs.get(id);
+        if (!doc) {
+            const url = `${this.collectionsUrl.replace(/\/+$/, "")}/${encodeURIComponent(id)}`;
+            doc = this.json<StacCollectionJson>(url).then((c) => absolutize(c, url));
+            this._collectionDocs.set(id, doc);
+            const pending = doc;
+            pending.catch(() => { if (this._collectionDocs.get(id) === pending) this._collectionDocs.delete(id); });
+        }
+        return doc;
+    }
+
+    /** A link of a collection by relation: from the listed collections when cached, else its own document. */
+    private async collectionLink(id: string, ...rels: string[]): Promise<string | undefined> {
+        const listed = (await this._collections?.catch(() => undefined))?.find((c) => c.id === id);
+        const fromListed = rels.map((r) => linkHref(listed, r)).find(Boolean);
+        if (fromListed) return fromListed;
+        const doc = await this.collectionDoc(id).catch(() => undefined);
+        return rels.map((r) => linkHref(doc, r)).find(Boolean);
+    }
+
+    /**
+     * Where the queryables of a collection (or of the API, without one) are: the `queryables` link (the OGC relation
+     * `http://www.opengis.net/def/rel/ogc/1.0/queryables`), else `{collection}/queryables` or `{url}/queryables`.
+     * Undefined when the server declares no Filter extension: then nothing is requested (servers without it answer
+     * 404, as INPE's and swisstopo's do).
+     */
+    private async queryablesUrl(collection?: string): Promise<string | undefined> {
+        if (!this.capabilities.filter) return undefined;
+        if (!collection) return linkHref(this.landing, QUERYABLES_REL) ?? linkHref(this.landing, "queryables") ?? `${this.url}/queryables`;
+        return await this.collectionLink(collection, QUERYABLES_REL, "queryables")
+            ?? `${this.collectionsUrl.replace(/\/+$/, "")}/${encodeURIComponent(collection)}/queryables`;
     }
 
     /**
@@ -714,10 +812,9 @@ export class StacClient {
      */
     async queryables(collection?: string): Promise<Queryable[]> {
         if (this.capabilities.staticCatalog) return collection ? summaryQueryables(await this.describeCollection(collection)) : [];
-        const url = collection ? `${this.url}/collections/${encodeURIComponent(collection)}/queryables` : `${this.url}/queryables`;
         try {
-            const schema = await this.json<{ properties?: Record<string, Record<string, unknown>> }>(url);
-            const props = Object.entries(schema.properties ?? {});
+            const schema = collection ? await this.queryablesSchema(collection) : await this.apiQueryables();
+            const props = Object.entries((schema?.properties ?? {}) as Record<string, Record<string, unknown>>);
             if (props.length) {
                 return props.map(([name, p]) => ({name, title: p.title as string | undefined, type: p.type as string | undefined,
                     enum: p.enum as unknown[] | undefined, minimum: p.minimum as number | undefined, maximum: p.maximum as number | undefined, source: "queryables"}));
@@ -745,15 +842,23 @@ export class StacClient {
     async queryablesSchema(collection: string): Promise<QueryablesSchema | null> {
         if (this._queryableSchemas.has(collection)) return this._queryableSchemas.get(collection)!;
         let schema: QueryablesSchema | null = null;
-        if (!this.capabilities.staticCatalog) {
+        const url = this.capabilities.staticCatalog ? undefined : await this.queryablesUrl(collection);
+        if (url) {
             try {
-                schema = await this.json(`${this.url}/collections/${encodeURIComponent(collection)}/queryables`);
+                schema = await this.json(url, undefined, QUERYABLES_ACCEPT);
             } catch {
                 schema = null;
             }
         }
         this._queryableSchemas.set(collection, schema && typeof schema === "object" ? schema : null);
         return this._queryableSchemas.get(collection)!;
+    }
+
+    /** The queryables of the whole API (its `/queryables`), or null when it serves none. */
+    private async apiQueryables(): Promise<QueryablesSchema | null> {
+        const url = await this.queryablesUrl();
+        if (!url) return null;
+        return this.json<QueryablesSchema>(url, undefined, QUERYABLES_ACCEPT).catch(() => null);
     }
 
     /** The collections of a static catalog, crawled once (a failure is not cached). */
@@ -1017,7 +1122,26 @@ export class StacClient {
             const found = await this.search({collections: [...new Set(refs.map((r) => r.collection))], ids: refs.map((r) => r.id)}).collect();
             return refs.map((r) => found.find((i) => i.id === r.id && (!i.collection || i.collection === r.collection))).filter((i): i is StacItemJson => !!i);
         }
-        return Promise.all(refs.map((r) => this.json<StacItemJson>(`${this.url}/collections/${encodeURIComponent(r.collection)}/items/${encodeURIComponent(r.id)}`)));
+        if (!this.capabilities.features && this.searchUrl) {
+            // No OGC API - Features items endpoint: one search by ids per collection.
+            const byCollection = new Map<string, string[]>();
+            for (const r of refs) byCollection.set(r.collection, [...(byCollection.get(r.collection) ?? []), r.id]);
+            const found = (await Promise.all([...byCollection].map(([collection, ids]) =>
+                this.search({collections: [collection], ids, limit: Math.min(ids.length, 100)}).collect()))).flat();
+            const missing = refs.filter((r) => !found.some((i) => i.id === r.id));
+            if (missing.length) throw new StacError(`Items not found: ${missing.map((r) => `${r.collection}/${r.id}`).join(", ")}`, 404, this.searchUrl);
+            return refs.map((r) => found.find((i) => i.id === r.id && (!i.collection || i.collection === r.collection))!);
+        }
+        return Promise.all(refs.map(async (r) => {
+            const url = `${await this.itemsUrl(r.collection)}/${encodeURIComponent(r.id)}`;
+            return absolutize(await this.json<StacItemJson>(url), url);
+        }));
+    }
+
+    /** The items endpoint of a collection: its `items` link, else `{collections endpoint}/{id}/items`. */
+    private async itemsUrl(collection: string): Promise<string> {
+        const href = await this.collectionLink(collection, "items");
+        return (href ?? `${this.collectionsUrl.replace(/\/+$/, "")}/${encodeURIComponent(collection)}/items`).replace(/[?#].*$/, "").replace(/\/+$/, "");
     }
 
     /**
@@ -1042,14 +1166,19 @@ export class StacClient {
             const [item] = await this.search({collections: [collection], limit: 1}).collect(1);
             return item ?? null;
         }
-        const page = await this.json<{ features?: StacItemJson[] }>(`${this.url}/collections/${encodeURIComponent(collection)}/items?limit=1`);
+        if (!this.capabilities.features && this.searchUrl) {
+            const [item] = await this.search({collections: [collection], limit: 1}).collect(1);
+            return item ?? null;
+        }
+        const url = `${await this.itemsUrl(collection)}?limit=1`;
+        const page = absolutize(await this.json<{ features?: StacItemJson[] }>(url), url, false);
         return page.features?.[0] ?? null;
     }
 
     // ------------------------------------------------------------------------------------------- HTTP
 
     /** @internal GET or POST with retries; throws StacError with status and body. */
-    async send(spec: HttpRequestSpec, signal?: AbortSignal, attempts?: number): Promise<{ status: number; json: unknown }> {
+    async send(spec: HttpRequestSpec, signal?: AbortSignal, attempts?: number, timeoutMs?: number): Promise<{ status: number; json: unknown }> {
         const f = this._options.fetch ?? fetch;
         const retry = {attempts: 3, statuses: [429, 502, 503, 504], backoffMs: 1000, ...this._options.retry};
         if (attempts !== undefined) retry.attempts = attempts;
@@ -1058,7 +1187,7 @@ export class StacClient {
         for (;;) {
             let response: Response;
             try {
-                const timeout = AbortSignal.timeout(this._options.timeoutMs ?? 30000);
+                const timeout = AbortSignal.timeout(timeoutMs ?? this._options.timeoutMs ?? 30000);
                 response = await accessFetch(url, this.accessFor(spec.url), {
                     method: spec.method,
                     headers: spec.headers,
@@ -1086,8 +1215,13 @@ export class StacClient {
                 return {status: response.status, json};
             }
             if (retry.statuses.includes(response.status) && attempt + 1 < retry.attempts) {
-                const after = Number(response.headers.get("Retry-After"));
-                await sleep(Number.isFinite(after) && after > 0 ? after * 1000 : retry.backoffMs * 2 ** attempt++);
+                const wait = retryAfterMs(response.headers.get("Retry-After"));
+                if (wait !== undefined && wait > (retry.maxWaitMs ?? 60000)) {
+                    throw new StacError(`HTTP ${response.status} from ${spec.url}: the server asks to wait ${Math.round(wait / 1000)} s before trying again`,
+                        response.status, spec.url, json);
+                }
+                await sleep(wait ?? retry.backoffMs * 2 ** attempt);
+                attempt++;
                 if (signal?.aborted) throw signal.reason;
                 continue;
             }
@@ -1104,8 +1238,8 @@ export class StacClient {
     }
 
     /** @internal */
-    async json<T>(url: string, attempts?: number): Promise<T> {
-        return (await this.send({method: "GET", url, headers: {Accept: "application/json"}}, undefined, attempts)).json as T;
+    async json<T>(url: string, attempts?: number, accept = "application/json"): Promise<T> {
+        return (await this.send({method: "GET", url, headers: {Accept: accept}}, undefined, attempts)).json as T;
     }
 
     /** @internal */
@@ -1149,9 +1283,13 @@ export function describe(c: StacCollectionJson): CollectionDescription {
             type: a.type as string | undefined, bands: assetBands(a)}));
     const commonNames: Record<string, string> = {};
     for (const a of assets) for (const b of a.bands) if (b.commonName && !commonNames[b.commonName]) commonNames[b.commonName] = a.key;
+    const index = Object.entries((c as { assets?: Record<string, { href?: string; type?: string; roles?: string[] }> }).assets ?? {})
+        .find(([key, a]) => typeof a?.href === "string" && (a.roles?.includes("collection-mirror") || /parquet/i.test(a.type ?? "") || key === "geoparquet-items"));
     return {
         id: c.id, title: c.title, description: c.description, license: c.license, keywords: c.keywords,
-        bbox: bboxes[0], subBboxes: bboxes.slice(1), interval, summaries: c.summaries ?? {}, assets, commonNames, raw: c,
+        bbox: bboxes[0], subBboxes: bboxes.slice(1), interval, summaries: c.summaries ?? {}, assets, commonNames,
+        ...(index ? {itemIndex: {key: index[0], href: index[1].href!, ...(index[1].type ? {type: index[1].type} : {}), roles: index[1].roles ?? []}} : {}),
+        raw: c,
     };
 }
 
@@ -1306,7 +1444,8 @@ export class StacSearch {
                 if (index === 0 && this._firstResponse?.spec === spec) {
                     response = this._firstResponse.response;
                 } else {
-                    response = (await this.client.send(next, this.signal)).json as StacItemCollectionJson;
+                    // Relative next links and asset hrefs resolve against the URL of the page that carried them.
+                    response = absolutize((await this.client.send(next, this.signal)).json as StacItemCollectionJson, next.url, false);
                     if (index === 0 && !this.cursor) this._firstResponse = {spec, response};
                 }
             } catch (e) {
@@ -1438,7 +1577,9 @@ export class StacSearch {
 
     /** Recovers from errors that have a known cure; returns the request to retry, or undefined. */
     private recover(error: StacError, spec: HttpRequestSpec, firstPage: boolean): HttpRequestSpec | undefined {
-        if (spec.method === "POST" && error.status === 405) {
+        // POST refused (405), or a first-page POST that failed without an HTTP status (a CORS preflight refused by a
+        // server that only allows GET): GET from now on.
+        if (spec.method === "POST" && (error.status === 405 || (firstPage && error.status === undefined))) {
             this.client.learn({postToGet: true});
             if (firstPage) {
                 this.replan();

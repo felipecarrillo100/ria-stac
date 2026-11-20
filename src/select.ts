@@ -19,7 +19,7 @@ import type {Bbox, GeoJsonArea, StacItemJson} from "./json.js";
  */
 export function defaultScore(item: StacItemJson): number {
     const cc = Number(item.properties["eo:cloud_cover"] ?? item.properties.cloud_cover ?? 50);
-    const t = Date.parse(String(item.properties.datetime ?? "")) || 0;
+    const t = Date.parse(String(item.properties.datetime ?? item.properties.start_datetime ?? "")) || 0;
     return (Number.isFinite(cc) ? cc : 50) - t / 1e15;
 }
 
@@ -279,7 +279,7 @@ export function groupItems(items: StacItemJson[], by: string | ((item: StacItemJ
     const key = typeof by === "function" ? by
         : by === "solar-day" ? (i: StacItemJson) => periodOf(i, "solar-day", solarLongitude(i))
             : by === "crs" ? (i: StacItemJson) => String(i.properties["proj:code"] ?? (i.properties["proj:epsg"] !== undefined ? `EPSG:${i.properties["proj:epsg"]}` : "unknown"))
-                : by === "datetime" ? (i: StacItemJson) => String(i.properties.datetime ?? "")
+                : by === "datetime" ? (i: StacItemJson) => String(i.properties.datetime ?? i.properties.start_datetime ?? "")
                     : (i: StacItemJson) => String(i.properties[by] ?? "");
     const out = new Map<string, StacItemJson[]>();
     for (const item of items) {

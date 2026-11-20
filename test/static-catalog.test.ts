@@ -70,12 +70,17 @@ describe("StacClient on a static catalog", () => {
                 extent: {spatial: {bbox: [[0, 0, 1, 1]]}, temporal: {interval: [[null, null]]}}, links: []}),
         });
         try {
-            const client = await StacClient.connect(`${server.url}/cat.json`, {requestHeaders: {Authorization: "Bearer t"}});
+            // By default a listing stops at a collection; nestedCollections looks inside them.
+            const plain = await StacClient.connect(`${server.url}/cat.json`);
+            expect((await plain.listCollections()).map((c) => c.id)).toEqual(["local", "s2-sample"]);
+            expect(server.requests.some((r) => r.url === "/deeper.json")).toBe(false);
+            server.requests.length = 0;
+            const client = await StacClient.connect(`${server.url}/cat.json`, {requestHeaders: {Authorization: "Bearer t"}, crawl: {nestedCollections: true}});
             expect((await client.listCollections()).map((c) => c.id)).toEqual(["local", "s2-sample", "deep"]);
             expect(server.requests.every((r) => r.headers.authorization === "Bearer t")).toBe(true);
             expect(outside.requests.length).toBeGreaterThan(0);
             expect(outside.requests.some((r) => r.headers.authorization !== undefined)).toBe(false);
-            const shallow = await StacClient.connect(`${server.url}/cat.json`, {crawl: {maxDepth: 1}});
+            const shallow = await StacClient.connect(`${server.url}/cat.json`, {crawl: {maxDepth: 1, nestedCollections: true}});
             expect((await shallow.listCollections()).map((c) => c.id)).toEqual(["local", "s2-sample"]);
         } finally {
             await outside.close();

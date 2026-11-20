@@ -38,6 +38,10 @@ function mockServer(options: {
     refuses?: RegExp;
     /** Answer 504 to this search page (from 1), as Planetary Computer does past page 1 for some collections. */
     failsPage?: number;
+    /** The methods the landing page's search links declare (one link each); default one link without a method. */
+    searchMethods?: string[];
+    /** Write the landing page's links and the next links relative to the document. */
+    relativeLinks?: boolean;
 }) {
     const base = "https://stac.test/v1";
     const calls: { method: string; url: string; body?: Record<string, unknown> }[] = [];
@@ -49,8 +53,10 @@ function mockServer(options: {
         calls.push({method, url: url.toString(), body});
         if (url.pathname === "/v1" || url.pathname === "/v1/") {
             if (options.landingNeedsSlash && url.pathname === "/v1") throw new TypeError("Failed to fetch");
+            const href = (path: string) => (options.relativeLinks ? (url.pathname.endsWith("/") ? `./${path}` : `./v1/${path}`) : `${base}/${path}`);
+            const search = (options.searchMethods ?? [undefined]).map((m) => ({rel: "search", href: href("search"), type: "application/geo+json", ...(m ? {method: m} : {})}));
             return json(200, {type: "Catalog", id: "test", stac_version: "1.1.0", conformsTo: options.conformsTo ?? [],
-                links: [{rel: "search", href: `${base}/search`, type: "application/geo+json"}, {rel: "data", href: `${base}/collections`}]});
+                links: [...search, {rel: "data", href: href("collections")}]});
         }
         if (url.pathname === "/v1/collections/s2/queryables" && options.queryables) return json(200, options.queryables);
         if (url.pathname === "/v1/collections/s2" && options.failsPage !== undefined) {
@@ -81,8 +87,8 @@ function mockServer(options: {
             const features = matches.slice((page - 1) * size, page * size);
             const links = page * size < matches.length
                 ? [method === "POST"
-                    ? {rel: "next", href: `${base}/search`, method: "POST", ...(options.mergePaging ? {merge: true, body: {page: page + 1}} : {body: {...params, page: page + 1}})}
-                    : {rel: "next", href: `${base}/search?${new URLSearchParams({...Object.fromEntries(url.searchParams), page: String(page + 1)})}`}]
+                    ? {rel: "next", href: options.relativeLinks ? "search" : `${base}/search`, method: "POST", ...(options.mergePaging ? {merge: true, body: {page: page + 1}} : {body: {...params, page: page + 1}})}
+                    : {rel: "next", href: `${options.relativeLinks ? "search" : `${base}/search`}?${new URLSearchParams({...Object.fromEntries(url.searchParams), page: String(page + 1)})}`}]
                 : [];
             return json(200, {type: "FeatureCollection", features, links, numberMatched: matches.length});
         }
@@ -145,7 +151,10 @@ describe("CQL2 on the server, by the classes it declares", () => {
         const search = client.search({collections: ["s2"], where});
         expect(ids(await search.collect())).toEqual(["S2A_1", "S2B_2"]);
         expect(search.plan.filterEncoding).toBe("cql2-text");
-        expect(calls.find((c) => c.url.endsWith("/search"))!.body!.filter).toBe("(eo:cloud_cover < 20) AND (platform LIKE 'sentinel-%')");
+        // CQL2-text goes as a GET parameter: POST bodies carry CQL2-JSON only (stac-fastapi refuses text there).
+        const sent = calls.find((c) => new URL(c.url).pathname.endsWith("/search"))!;
+        expect(sent.method).toBe("GET");
+        expect(new URL(sent.url).searchParams.get("filter")).toBe("(eo:cloud_cover < 20) AND (platform LIKE 'sentinel-%')");
     });
 
     it("an asset-format filter stays on the client, beside a server-side comparison", async () => {
@@ -200,7 +209,7 @@ describe("CQL2 on the server, by the classes it declares", () => {
         expect(ids(await search.collect())).toEqual(["S2A_1", "S2B_2"]);
         expect(search.plan.degradations).toContainEqual({kind: "filter-refused", encoding: "cql2-json", message: "Operator not supported"});
         // CQL2-JSON refused, then CQL2-text (also refused), then the client.
-        expect(calls.filter((c) => c.url.endsWith("/search")).length).toBeGreaterThanOrEqual(3);
+        expect(calls.filter((c) => new URL(c.url).pathname.endsWith("/search")).length).toBeGreaterThanOrEqual(3);
         expect(search.plan.filterEncoding).toBe("client");
     });
 
@@ -627,5 +636,48 @@ describe("static catalog search: parts outside the area are not read", () => {
         expect(calls).not.toContain("/c/far/e.json");
         // Without an area nothing is skipped.
         expect((await client.search({collections: ["tiles"]}).collect()).map((i) => i.id).sort()).toEqual(["a", "b", "c", "d", "e"]);
+    });
+});
+
+// ------------------------------------------------------------------------------------------------ links and methods
+
+describe("links and methods, as the API declares them", () => {
+    const items = [item("a", {"eo:cloud_cover": 1}), item("b", {"eo:cloud_cover": 2}), item("c", {"eo:cloud_cover": 3})];
+    const C2 = [C("core"), C("item-search")];
+    const ids = (items: StacItemJson[]) => items.map((i) => i.id);
+
+    it("searches with GET when the search links declare only GET, and with POST when they declare it", async () => {
+        let {calls} = mockServer({conformsTo: C2, items, searchMethods: ["GET"]});
+        let client = await StacClient.connect("https://stac.test/v1");
+        expect(client.capabilities.searchMethods).toEqual(["GET"]);
+        await client.search({collections: ["s2"]}).collect();
+        expect(calls.filter((c) => new URL(c.url).pathname === "/v1/search").map((c) => c.method)).toEqual(["GET"]);
+        ({calls} = mockServer({conformsTo: C2, items, searchMethods: ["GET", "POST"]}));
+        client = await StacClient.connect("https://stac.test/v1");
+        await client.search({collections: ["s2"]}).collect();
+        expect(calls.filter((c) => new URL(c.url).pathname === "/v1/search").map((c) => c.method)).toEqual(["POST"]);
+    });
+
+    it("falls back to GET when a first-page POST fails without a status (a refused CORS preflight)", async () => {
+        const {calls} = mockServer({conformsTo: C2, items});
+        const real = globalThis.fetch;
+        vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
+            if ((init?.method ?? "GET").toUpperCase() === "POST") throw new TypeError("Failed to fetch");
+            return real(input, init);
+        }));
+        const client = await StacClient.connect("https://stac.test/v1", {retry: {attempts: 1}});
+        expect(ids(await client.search({collections: ["s2"]}).collect())).toEqual(["a", "b", "c"]);
+        expect(client.profile.postToGet).toBe(true);
+        expect(calls.filter((c) => new URL(c.url).pathname === "/v1/search").map((c) => c.method)).toEqual(["GET"]);
+    });
+
+    it("resolves relative landing, search and next links against the document that carries them", async () => {
+        for (const methods of [["GET"], ["GET", "POST"]]) {
+            const {calls} = mockServer({conformsTo: C2, items, pageSize: 1, relativeLinks: true, searchMethods: methods});
+            const client = await StacClient.connect("https://stac.test/v1");
+            expect(client.searchUrl).toBe("https://stac.test/v1/search");
+            expect(ids(await client.search({collections: ["s2"], limit: 1}).collect())).toEqual(["a", "b", "c"]);
+            expect(calls.every((c) => c.url.startsWith("https://stac.test/v1"))).toBe(true);
+        }
     });
 });

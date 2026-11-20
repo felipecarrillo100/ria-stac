@@ -128,7 +128,8 @@ export interface StacSelection {
 
 /**
  * How {@link StacClient.select} chooses among the items found. Default (`{}`): the one best item (least cloud,
- * then newest) whose footprint contains the whole area.
+ * then newest) whose footprint contains the whole area, or, when no item does (tiled products such as swisstopo's
+ * 1 km swissALTI3D tiles), the fewest items that together cover it.
  *
  * The steps run in this order: `months` filters the items; `coverage` filters them when there is an area; then
  * either `per` picks the best item (or covering set) of each period, or, without `per`, one item (or one covering
@@ -137,13 +138,19 @@ export interface StacSelection {
  * @category Choosing data */
 export interface Pick {
     /**
-     * With an area: `"full"` (default) keeps only items whose footprint contains the whole area, then picks the
-     * best one (or the best per period). `"best"` keeps every item: when no item covers the area alone, the result
-     * is the fewest items that together cover it (a mosaic, best ranked first, all in one coordinate reference as
-     * with `per`); otherwise the best ranked among the items that cover nearly as much as the best one. Ignored
-     * without an area.
+     * With an area:
+     * - `"auto"` (default): `"full"` when at least one item contains the whole area, else `"best"` (with a warning
+     *   in `problems` saying a mosaic was picked); with `per`, `"best"`, so that no period is lost for want of one
+     *   covering item.
+     * - `"full"` keeps only items whose footprint contains the whole area, then picks the best one (or the best per
+     *   period).
+     * - `"best"` keeps every item: when no item covers the area alone, the result is the fewest items that together
+     *   cover it (a mosaic, best ranked first, all in one coordinate reference as with `per`); otherwise the best
+     *   ranked among the items that cover nearly as much as the best one.
+     *
+     * Ignored without an area.
      */
-    coverage?: "full" | "best";
+    coverage?: "auto" | "full" | "best";
     /**
      * Which item is best. Default `"least-cloud"`: lowest `eo:cloud_cover` (50 when missing), then newest.
      * `"newest"` and `"oldest"` use the item's `datetime` (else `start_datetime`). `{closestTo}` takes the item
@@ -243,7 +250,8 @@ export interface StacCandidate {
     /**
      * Why it was not picked (unset when picked), in the order the rules apply:
      * - `"months"`: its month is not in `pick.months`;
-     * - `"coverage"`: with `coverage: "full"` (the default), its footprint does not contain the whole area;
+     * - `"coverage"`: with `coverage: "full"` (or `"auto"` when another item contains the area), its footprint does
+     *   not contain the whole area;
      * - `"reference"`: its coordinate reference is not the one used, see {@link StacSelectionResult.dropped};
      * - `"rank"`: other items ranked better (or, in a mosaic, it added too little to the area covered).
      */
@@ -541,7 +549,15 @@ export async function selectItems(client: StacClient, selection: StacSelection &
         exclude(candidates.filter((i) => !kept.includes(i)), "months");
         candidates = kept;
     }
-    const coverage = pick.coverage ?? "full";
+    // "auto": one item when one contains the area, else a mosaic (per period: always the best covering set).
+    let coverage: "full" | "best" = pick.coverage === "best" || pick.coverage === "full" ? pick.coverage : "full";
+    if (area && (pick.coverage ?? "auto") === "auto") {
+        coverage = pick.per || !itemsCovering(candidates, area).length ? "best" : "full";
+        if (coverage === "best" && !pick.per && candidates.length) {
+            problems.push({path: "pick.coverage", severity: "warning",
+                message: "no single item contains the whole area: picked the fewest items that together cover it (a mosaic)"});
+        }
+    }
     if (area && coverage === "full") {
         const kept = itemsCovering(candidates, area);
         exclude(candidates.filter((i) => !kept.includes(i)), "coverage");

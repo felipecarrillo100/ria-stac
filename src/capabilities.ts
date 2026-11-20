@@ -55,10 +55,21 @@ export interface StacCapabilities {
     sort: boolean;
     /** The Fields extension (`fields: {include, exclude}`). */
     fields: boolean;
-    /** The Free-text search extension (`q`). */
+    /** The Free-text search extension (`q`), basic or advanced. */
     freeText: boolean;
+    /**
+     * Advanced free-text search (`#advanced-free-text`): `q` is one expression with `AND`, `OR`, quotes and
+     * parentheses. Basic free-text takes a list of terms (any of them matches).
+     */
+    freeTextAdvanced: boolean;
     /** The Collection Search extension. */
     collectionSearch: boolean;
+    /**
+     * The methods the landing page's `search` links declare (`method`), or undefined when no link declares one.
+     * POST is optional in STAC API - Item Search: a client uses POST only when it is declared, or, when nothing is
+     * declared, tries it and falls back to GET.
+     */
+    searchMethods?: ("GET" | "POST")[];
     /** The Aggregation extension. */
     aggregation: boolean;
     /**
@@ -126,7 +137,14 @@ function cql2Conformance(declared: (name: string) => boolean): string[] {
 export function parseCapabilities(landing: StacCatalogJson, conformance?: string[]): StacCapabilities {
     const uris = [...new Set([...(landing.conformsTo ?? []), ...(conformance ?? [])])];
     const links = landing.links ?? [];
-    const searchLink = links.some((l) => l.rel === "search");
+    const searchLinks = links.filter((l) => l.rel === "search");
+    const searchLink = searchLinks.length > 0;
+    const declared = searchLinks.map((l) => (typeof l.method === "string" ? l.method.toUpperCase() : undefined)).filter((m): m is string => !!m);
+    // Links that declare a method are authoritative; a link without one means GET (STAC API - Core), but when no
+    // link declares any method the client tries POST and falls back (servers such as INPE's accept both).
+    const searchMethods = declared.length
+        ? [...new Set(searchLinks.map((l) => (typeof l.method === "string" ? l.method.toUpperCase() : "GET")))].filter((m): m is "GET" | "POST" => m === "GET" || m === "POST")
+        : undefined;
     // api.stacspec.org/{version}/{class}[#extension]: version segments differ, so match the class name.
     const stac = (name: string) => new RegExp(`stacspec\\.org\\/[^/]+\\/${name}$`);
     const itemSearch = has(uris, stac("item-search")) || (searchLink && uris.length === 0);
@@ -136,6 +154,7 @@ export function parseCapabilities(landing: StacCatalogJson, conformance?: string
     const cql2 = (name: string) => has(filterUris, new RegExp(`cql2\\/[^/]+\\/conf\\/${name}$`, "i"));
     return {
         stacVersion: landing.stac_version,
+        ...(searchMethods ? {searchMethods} : {}),
         conformsTo: uris,
         core: has(uris, stac("core")),
         collections,
@@ -157,7 +176,8 @@ export function parseCapabilities(landing: StacCatalogJson, conformance?: string
         query: has(uris, /item-search#query$/),
         sort: has(uris, /item-search#sort$/),
         fields: has(uris, /item-search#fields$/),
-        freeText: has(uris, /item-search#free-text$/),
+        freeText: has(uris, /item-search#(advanced-)?free-text$/),
+        freeTextAdvanced: has(uris, /item-search#advanced-free-text$/),
         collectionSearch: has(uris, /collection-search(#[a-z-]+)?$/),
         aggregation: has(uris, /aggregation(#[a-z-]+)?$/),
         staticCatalog: !itemSearch && !collections && (landing.type === "Catalog" || landing.type === "Collection"),

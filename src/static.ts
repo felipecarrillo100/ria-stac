@@ -65,13 +65,13 @@ async function inParallel<T, R>(values: T[], n: number, f: (v: T) => Promise<R>)
 
 /**
  * The collections of a static catalog: the landing page when it is a collection, else the collections reached by
- * `child` links (collections' own children included), breadth first, at most `maxDepth` links deep and
- * `maxDocuments` documents read.
+ * `child` links, breadth first, at most `maxDepth` links deep and `maxDocuments` documents read. The children of a
+ * collection are not read unless `crawl.nestedCollections` is set.
  *
  * @internal
  */
 export async function crawlCollections(client: StacClient, landing: Doc, landingUrl: string): Promise<{ collections: StacCollectionJson[]; urls: Map<string, string> }> {
-    const {maxDepth, maxDocuments, concurrency} = limits(client);
+    const {maxDepth, maxDocuments, concurrency, nestedCollections} = limits(client);
     const collections: StacCollectionJson[] = [];
     const urls = new Map<string, string>();
     const seen = new Set<string>([landingUrl]);
@@ -85,7 +85,8 @@ export async function crawlCollections(client: StacClient, landing: Doc, landing
             }
         }
         if (depth >= maxDepth) break;
-        const children = level.flatMap(({doc}) => hrefs(doc, "child")).filter((u) => !seen.has(u) && (seen.add(u), true));
+        const children = level.filter(({doc}) => nestedCollections || doc.type !== "Collection")
+            .flatMap(({doc}) => hrefs(doc, "child")).filter((u) => !seen.has(u) && (seen.add(u), true));
         const room = Math.max(0, maxDocuments - read_);
         const batch = children.slice(0, room);
         read_ += batch.length;

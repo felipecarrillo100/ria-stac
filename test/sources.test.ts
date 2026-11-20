@@ -41,7 +41,7 @@ describe("StacClient: capabilities and choice", () => {
             const url = String(input);
             if (!url.startsWith("https://stac.test")) return realFetch(input, init);
             calls.push(url);
-            if (url === "https://stac.test/v1") return json({stac_version: "1.1.0", conformsTo: ["https://api.stacspec.org/v1.0.0/item-search", "https://api.stacspec.org/v1.0.0/item-search#query"],
+            if (url === "https://stac.test/v1") return json({stac_version: "1.1.0", conformsTo: ["https://api.stacspec.org/v1.0.0/item-search", "https://api.stacspec.org/v1.0.0/item-search#query", "https://api.stacspec.org/v1.0.0/item-search#filter"],
                 links: [{rel: "search", href: "https://stac.test/v1/search"}, {rel: "data", href: "https://stac.test/v1/collections"}]});
             if (url === "https://stac.test/v1/collections") return failures-- > 0 ? json({}, 500) : json({collections: [collection, other]});
             if (url === "https://stac.test/v1/collections/s2") return json(collection);

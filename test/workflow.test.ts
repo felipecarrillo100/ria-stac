@@ -134,10 +134,27 @@ describe("select: progress, cancel and candidates", () => {
     it("says which rule excluded the items when none is left", async () => {
         stubApi([items[2], items[3]]);
         const client = await StacClient.connect("https://stac.test/v1");
-        const error = await client.select({collection: "s2", area, pick: {months: [6, 7, 8]}}).catch((e: unknown) => e);
+        const error = await client.select({collection: "s2", area, pick: {months: [6, 7, 8], coverage: "full"}}).catch((e: unknown) => e);
         expect(error).toBeInstanceOf(StacError);
         expect((error as StacError).problems.map((p) => p.path)).toEqual(["pick.months", "pick.coverage"]);
         expect((error as StacError).problems[1].message).toContain('use coverage "best"');
+    });
+
+    it("picks one covering item when there is one, else a mosaic of tiles (coverage auto, the default)", async () => {
+        // Four tiles that each cover a quarter of the area, as swisstopo's 1 km swissALTI3D tiles do for a view.
+        const [w, s, e, n] = [7.4, 46.9, 7.6, 47.1];
+        const mx = (w + e) / 2, my = (s + n) / 2;
+        const tiles = [[w, s, mx, my], [mx, s, e, my], [w, my, mx, n], [mx, my, e, n]].map((b, i) => boxItem(`tile${i}`, b as [number, number, number, number], "2024-06-01T10:00:00Z"));
+        stubApi(tiles);
+        let client = await StacClient.connect("https://stac.test/v1");
+        let found = await client.select({collection: "s2", area: [w + 0.01, s + 0.01, e - 0.01, n - 0.01]});
+        expect(found.items.map((i) => i.id).sort()).toEqual(["tile0", "tile1", "tile2", "tile3"]);
+        expect(found.problems.map((p) => p.path)).toContain("pick.coverage");
+        // One item that contains the area: that item alone.
+        stubApi([...tiles, boxItem("big", [w - 1, s - 1, e + 1, n + 1], "2024-05-01T10:00:00Z")]);
+        client = await StacClient.connect("https://stac.test/v1");
+        found = await client.select({collection: "s2", area: [w + 0.01, s + 0.01, e - 0.01, n - 0.01]});
+        expect(found.items.map((i) => i.id)).toEqual(["big"]);
     });
 
     it("aborts the requests and rejects with the signal's reason", async () => {

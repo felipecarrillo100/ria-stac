@@ -9,3 +9,4 @@ build/
 .claude/
 CLAUDE.md
 CLAUDE.local.md
+spikes/*.log

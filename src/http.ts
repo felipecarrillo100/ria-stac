@@ -2,7 +2,46 @@
  * Protected data: credentials, headers and parameters (LuciadRIA's HttpRequestOptions), sent only to the origin
  * they were given for, with redirects to another origin refused.
  */
-import type {HttpRequestHeaders, HttpRequestParameters, HttpRequestOptions} from "@luciad/ria/util/HttpRequestOptions.js";
+/**
+ * HTTP headers sent with a request, by name.
+ *
+ * The same shape as LuciadRIA's `HttpRequestHeaders`, so the objects an application gives LuciadRIA (or
+ * ria-geotiff) can be given here as they are.
+ *
+ * @category Protected data
+ */
+export interface HttpRequestHeaders {
+    [headerName: string]: string;
+}
+
+/**
+ * Query parameters added to a request URL, by name; `null` and `undefined` values are left out.
+ *
+ * The same shape as LuciadRIA's `HttpRequestParameters`.
+ *
+ * @category Protected data
+ */
+export interface HttpRequestParameters {
+    [parameterName: string]: string | number | boolean | null | undefined;
+}
+
+/**
+ * Credentials, headers and query parameters of a request: what {@link StacClientOptions} and an
+ * {@link AccessHook} give. The same shape as LuciadRIA's `HttpRequestOptions`, so one object serves both.
+ *
+ * @category Protected data
+ */
+export interface HttpRequestOptions {
+    /**
+     * Cookies and HTTP authentication: `true` sends them to every origin (`"include"`), `false` or unset only to the
+     * page's own origin (`"same-origin"`), or a fetch `credentials` mode.
+     */
+    credentials?: boolean | RequestCredentials;
+    /** Headers added to the request, or null for none. */
+    requestHeaders?: HttpRequestHeaders | null;
+    /** Query parameters added to the request URL, or null for none. */
+    requestParameters?: HttpRequestParameters | null;
+}
 
 /**
  * What a request is for, as passed to an {@link AccessHook}: `"stac-api"` (STAC API, catalog, collection and item
@@ -81,9 +120,11 @@ export class RedirectWithheldError extends Error {
      *
      * @param host The host the credentials were withheld from.
      * @param url The URL that redirected (without added parameters).
+     * @param why Why the redirect was refused, when the host alone does not say it.
      */
-    constructor(readonly host: string, url: string) {
-        super(`${url} redirects to ${host}: the request's credentials, headers and parameters were withheld from that host`);
+    constructor(readonly host: string, url: string, why?: string) {
+        super(`${url} redirects to ${host}${why ? ` (${why})` : ""}: the request's credentials, headers and parameters were withheld from that host. `
+            + "Use the URL it redirects to, or an access hook.");
         this.name = "RedirectWithheldError";
     }
 }
@@ -172,6 +213,7 @@ async function accessFetchOnce(url: string, access: HttpRequestOptions | null, i
     for (let hop = 0; hop < 6; hop++) {
         const response = await fetchFn(addParameters(current, params), {...init, headers, credentials, ...(guarded ? {redirect: "manual"} : {})});
         if (!guarded || !(response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400 && response.status !== 304))) return response;
+        if (response.type === "opaqueredirect") return followHidden(current, access, {...init, headers, credentials}, fetchFn);
         const location = response.headers.get("Location");
         if (!location) throw new RedirectWithheldError("an undisclosed host", current);
         const next = new URL(location, current);
@@ -180,6 +222,29 @@ async function accessFetchOnce(url: string, access: HttpRequestOptions | null, i
         current = next.toString();
     }
     throw new Error(`Too many redirects from ${url}`);
+}
+
+/**
+ * A redirect whose target a browser hides (`redirect: "manual"` gives an opaque response without `Location`). The
+ * request is sent again and the browser follows the redirect itself, when nothing secret can reach another origin:
+ * the query parameters are only in the first URL (a redirect target gets what its `Location` holds), and the only
+ * header allowed is `Authorization`, which browsers drop on a redirect to another origin (Fetch standard). Other
+ * headers (an API key in `X-Api-Key`) would be sent on, so such a redirect is refused. A redirect that ends on
+ * the same origin and is refused (401, 403) is retried there with the parameters.
+ */
+async function followHidden(url: string, access: HttpRequestOptions | null, init: RequestInit, fetchFn: typeof fetch): Promise<Response> {
+    const secretHeaders = Object.keys(access?.requestHeaders ?? {}).filter((h) => h.toLowerCase() !== "authorization");
+    if (secretHeaders.length) {
+        throw new RedirectWithheldError("an undisclosed host", url,
+            `the browser does not show where it goes, and the header(s) ${secretHeaders.join(", ")} could reach another origin`);
+    }
+    const params = access?.requestParameters;
+    const response = await fetchFn(addParameters(url, params), {...init, redirect: "follow"});
+    const final = response.url ? new URL(response.url) : null;
+    if (!isEmpty(params) && final && final.origin === new URL(url).origin && (response.status === 401 || response.status === 403)) {
+        return fetchFn(addParameters(final.toString(), params), {...init, redirect: "follow"});
+    }
+    return response;
 }
 
 /**
