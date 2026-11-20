@@ -1,0 +1,11 @@
+node_modules/
+lib/
+.idea/
+*.tgz
+coverage/
+# Generated API reference
+build/
+# Local tool configuration
+.claude/
+CLAUDE.md
+CLAUDE.local.md

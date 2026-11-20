@@ -1,0 +1,59 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": [
+    "src/index.ts"
+  ],
+  "out": "build/docs",
+  "tsconfig": "tsconfig.json",
+  "name": "ria-stac",
+  "readme": "README.md",
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "excludeExternals": true,
+  "externalPattern": [
+    "**/node_modules/**"
+  ],
+  "sort": [
+    "kind",
+    "alphabetical"
+  ],
+  "validation": {
+    "notExported": false,
+    "invalidLink": true,
+    "notDocumented": true
+  },
+  "requiredToBeDocumented": [
+    "Class",
+    "Function",
+    "Method",
+    "Interface",
+    "TypeAlias",
+    "Enum",
+    "Variable",
+    "Property",
+    "Accessor",
+    "Constructor"
+  ],
+  "categorizeByGroup": false,
+  "defaultCategory": "Other",
+  "navigation": {
+    "includeCategories": true,
+    "includeGroups": false,
+    "includeFolders": false
+  },
+  "searchInComments": true,
+  "searchInDocuments": true,
+  "hideGenerator": true,
+  "disableSources": true,
+  "categoryOrder": [
+    "Client",
+    "Choosing data",
+    "Search",
+    "Selection helpers",
+    "Assets and bands",
+    "STAC JSON",
+    "Protected data",
+    "Errors",
+    "*"
+  ]
+}

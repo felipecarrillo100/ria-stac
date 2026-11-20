@@ -1,13 +1,6 @@
 import {afterEach, describe, expect, it} from "vitest";
-import {addReference, parseWellKnownText} from "@luciad/ria/reference/ReferenceProvider.js";
-import {GeoTiffTileSetModel} from "../src/index.js";
-import {StacClient} from "../src/stac/index.js";
-import {startRangeServer, tileData} from "./helpers.js";
-
-addReference(parseWellKnownText(`PROJCS["WGS 84 / UTM zone 33N",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],
-PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],
-PARAMETER["central_meridian",15],PARAMETER["scale_factor",0.9996],PARAMETER["false_easting",500000],PARAMETER["false_northing",0],
-UNIT["metre",1],AUTHORITY["EPSG","32633"]]`), "EPSG:32633");
+import {StacClient} from "../src/index.js";
+import {startRangeServer} from "./helpers.js";
 
 type Server = Awaited<ReturnType<typeof startRangeServer>>;
 let server: Server | null = null;
@@ -54,7 +47,7 @@ describe("StacClient on a static catalog", () => {
         expect((await client.items([{collection: "s2-sample", id: "sample-2025"}])).map((i) => i.id)).toEqual(["sample-2025"]);
     });
 
-    it("selects items per year and opens them as a model, with relative assets resolved", async () => {
+    it("selects items per year, with relative assets resolved", async () => {
         server = await startRangeServer();
         const client = await StacClient.connect(`${server.url}/static-catalog/catalog.json`);
         const found = await client.select({collection: "s2-sample", area: AREA, bands: ["red", "nir"], pick: {per: "year"}});
@@ -62,10 +55,6 @@ describe("StacClient on a static catalog", () => {
         expect(found.periods).toEqual(["2024", "2025"]);
         expect(found.plan.filterEncoding).toBe("client");
         expect(found.items[0].assets.red.href).toBe(`${server.url}/s2-red-10m.tif`);
-        const model = await GeoTiffTileSetModel.create({stac: {items: found.items, per: "year"}, pool: null});
-        expect(model.getBandNames()).toEqual(["red_2024", "nir_2024", "red_2025", "nir_2025"]);
-        expect(model.getSource().periods).toEqual(["2024", "2025"]);
-        await tileData(model, {level: 0, x: 0, y: 0});
     });
 
     it("sends the client's options to the catalog's origin only, and respects the crawl limits", async () => {

@@ -1,14 +1,18 @@
 /**
- * ria-geotiff/stac: find Cloud Optimized GeoTIFFs through STAC APIs and turn them into stacked models.
+ * ria-stac: find data through STAC, for LuciadRIA applications.
  *
- * Steps 1 and 2 of the workflow: connect to an API (StacClient.connect), learn what it offers (collections,
- * collection), check a selection (check) and pick items (select). The items then go to
- * `GeoTiffTileSetModel.create({stac: {items}})`. Power users plan and run searches themselves (search, plan,
- * StacSearch), choose items (coverArea, bestPerPeriod, ...), and resolve and sign assets (resolveAsset,
- * toBandInputs). Everything is plain JSON in and out.
+ * Connect to a STAC API, a static catalog or a collection ({@link StacClient.connect}), learn what it offers
+ * ({@link StacClient.collections}, {@link StacClient.collection}), check a selection ({@link StacClient.check}) and
+ * pick items ({@link StacClient.select}). Power users plan and run searches themselves ({@link StacClient.search},
+ * {@link planSearch}, {@link StacSearch}), choose items ({@link coverArea}, {@link bestPerPeriod}, ...), and
+ * resolve and sign assets ({@link resolveAsset}). Everything is plain STAC JSON in and out: the items found go to
+ * the library that opens their assets, for example ria-geotiff for Cloud Optimized GeoTIFFs.
+ *
+ * Requests carry LuciadRIA's `credentials`, `requestHeaders` and `requestParameters`, sent only to the origin they
+ * were given for.
  *
  * @packageDocumentation
- * @module ria-geotiff/stac
+ * @module ria-stac
  */
 export {StacClient, StacSearch, StacError, describe as describeCollectionJson, followNext} from "./client.js";
 export {COLLECTION_PAGE_SIZE} from "./client.js";
@@ -27,9 +31,10 @@ export type {AssetSigner, ResolvedAsset} from "./assets.js";
 export {assetBands, assetFormat, isDataAsset, itemFormats, isGeoTiffAsset, type AssetFormat} from "./bands.js";
 export type {BandDescriptor} from "./bands.js";
 export {bboxesIntersect, bboxOf, coverageOf, footprintOf, intersectsArea, isGlobalBbox} from "./geometry.js";
-export {assetBandMap, isCategoricalAsset, itemBandNames, toBandInputs} from "./bridge.js";
-export type {ItemBandsOptions} from "./bridge.js";
+export {RiaStacError} from "./errors.js";
+export type {RiaStacProblem} from "./errors.js";
+export type {AccessHook, AccessKind, RiaStacRequest, RiaStacRequestListener} from "./http.js";
 export type {Bbox, GeoJsonArea, StacAssetJson, StacCatalogJson, StacCollectionJson, StacItemCollectionJson, StacItemJson, StacLink} from "./json.js";
 export {collectionBands, elevationHint, SELECT_MAX_ITEMS, SELECT_MAX_ITEMS_LIMIT, SELECT_PAGE_SIZE, SELECT_SCAN_LIMIT, selectionToRequest} from "./catalog.js";
 export type {CollectionDetails, CollectionSummary, Pick, StacCandidate, StacSelection, StacSelectionResult} from "./catalog.js";
-export type {StacCatalogSource, StacItemOptions, StacItemsSource, StacModelSource} from "./source.js";
+

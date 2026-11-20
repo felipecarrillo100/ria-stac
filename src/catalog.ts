@@ -4,7 +4,7 @@
  * 1. `collections(filter)` and `collection(id)`: what a catalog offers (extents, bands, filterable properties).
  * 2. `check(selection, collection)`: problems found before any search; `select(selection)`: search and pick items.
  */
-import type {RiaGeoTiffProblem} from "../errors.js";
+import type {RiaStacProblem} from "./errors.js";
 import {nameAssetBands} from "./bands.js";
 import {cql2Predicate, formatsFilter} from "./cql2.js";
 import {StacError, type CollectionDescription, type Queryable, type StacClient} from "./client.js";
@@ -209,7 +209,7 @@ export interface StacSelectionResult {
      * The warnings of {@link StacClient.check} (errors stop before the search), plus a warning with path `"pick"`
      * when candidates were dropped (see `dropped`).
      */
-    problems: RiaGeoTiffProblem[];
+    problems: RiaStacProblem[];
     /**
      * Candidates left out because a model needs one coordinate reference, one entry per other reference: empty
      * when nothing was left out. This happens only when the result can hold several items (with `pick.per`, or
@@ -295,9 +295,9 @@ export function elevationHint(collection: StacCollectionJson): string | null {
 }
 
 /**
- * Band names a collection's items would give (from item_assets), as the bridge names them.
+ * Band names a collection's items would give (from item_assets), as ria-geotiff names the bands of a model.
  *
- * The rule is the one of {@link itemBandNames} and {@link assetBandMap}, applied to the collection's data assets: a
+ * The rule is the one of ria-geotiff's `itemBandNames`, applied to the collection's data assets: a
  * single-band asset gives its EO common name when no other asset shares it, else its key; a multiband asset gives
  * one name per band (common name, else name, else `{key}_b{n}`); names are made valid identifiers; `nir08` /
  * `lwir11` become `nir` / `lwir` when those are free. Items can describe their assets differently from the
@@ -341,8 +341,8 @@ export function summarise(d: CollectionDescription): CollectionSummary {
  *
  * @category Choosing data
  */
-export function checkSelection(selection: StacSelection, collection: CollectionDetails | undefined): RiaGeoTiffProblem[] {
-    const problems: RiaGeoTiffProblem[] = [];
+export function checkSelection(selection: StacSelection, collection: CollectionDetails | undefined): RiaStacProblem[] {
+    const problems: RiaStacProblem[] = [];
     if (!collection) return [{path: "collection", severity: "error", message: `the catalog has no collection "${selection.collection}"`}];
     const max = selection.maxItems;
     if (max !== undefined && !(Number.isInteger(max) && max >= 1 && max <= SELECT_MAX_ITEMS_LIMIT)) {
@@ -583,7 +583,7 @@ export async function selectItems(client: StacClient, selection: StacSelection &
 
 /** When no item is left: one warning per rule that excluded items, saying what to relax. */
 function emptyReasons(found: StacItemJson[], records: StacCandidate[], selection: StacSelection & { pick?: Pick },
-    rejected: Record<string, number>, scan: { skipped: number; truncated: boolean; formats: string[] }): RiaGeoTiffProblem[] {
+    rejected: Record<string, number>, scan: { skipped: number; truncated: boolean; formats: string[] }): RiaStacProblem[] {
     if (!found.length && scan.skipped) {
         // Items were found, in other formats: widening would only bring more of them.
         return [{path: "formats", severity: "warning", message: scan.truncated
@@ -605,7 +605,7 @@ function emptyReasons(found: StacItemJson[], records: StacCandidate[], selection
             selection.maxCloud !== undefined ? "maxCloud" : "", ...Object.keys(selection.where ?? {}).map((k) => `where.${k}`)].filter(Boolean);
         return [{path: "", severity: "warning", message: `the search found no item${filters.length ? `: widen ${filters.join(", ")}` : ""}`}];
     }
-    const out: RiaGeoTiffProblem[] = [];
+    const out: RiaStacProblem[] = [];
     const months = records.filter((r) => r.reason === "months").length;
     if (months) out.push({path: "pick.months", severity: "warning", message: `excluded ${months} of ${found.length} item(s) found: none of their months is in [${selection.pick!.months!.join(", ")}]`});
     const partial = records.filter((r) => r.reason === "coverage");

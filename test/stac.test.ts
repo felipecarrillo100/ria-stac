@@ -1,10 +1,10 @@
 import {fromText} from "ogc-cql2/parse";
 import {afterEach, describe, expect, it, vi} from "vitest";
 import {COLLECTION_PAGE_SIZE, isGlobalBbox, SELECT_PAGE_SIZE, 
-    assetBands, bestPerPeriod, coverArea, dedupeItems, emptyProfile, evaluateCql2, groupItems, itemBandNames,
+    assetBands, bestPerPeriod, coverArea, dedupeItems, emptyProfile, evaluateCql2, groupItems,
     itemsCovering, normaliseDatetime, parseCapabilities, planetaryComputerSigner, planSearch, resolveAsset, sortItems,
-    StacClient, StacError, splitFilter, formatsFilter, toBandInputs, toCql2Text, type StacItemJson,
-} from "../src/stac/index.js";
+    StacClient, StacError, splitFilter, formatsFilter, toCql2Text, type StacItemJson,
+} from "../src/index.js";
 
 // ------------------------------------------------------------------------------------------------ fixtures
 
@@ -403,7 +403,7 @@ describe("selection", () => {
     });
 });
 
-describe("assets and band inputs", () => {
+describe("assets", () => {
     const s2 = item("S2", {}, undefined, {
         // Earth Search style (STAC 1.0)
         red: {href: "https://e84.test/B04.tif", type: "image/tiff; application=geotiff; profile=cloud-optimized",
@@ -428,51 +428,14 @@ describe("assets and band inputs", () => {
         expect(assetBands(pc.assets.B04)).toEqual([{name: "B04", commonName: "red", scale: 0.0001, offset: -0.1, nodata: 0}]);
     });
 
-    it("names bands by common name, so presets work on every catalog", () => {
-        expect(itemBandNames(s2)).toEqual({red: "red", nir: "nir", nir08: "nir08", scl: "scl"});
-        expect(itemBandNames(pc)).toEqual({B04: "red", B08: "nir", SR_B5: "nir08", SCL: "SCL"});   // "quality" is no EO role
-        expect(itemBandNames(item("L", {}, undefined, {SR_B5: {href: "https://x/b5.tif", type: "image/tiff", "eo:bands": [{common_name: "nir08"}]}})))
-            .toEqual({SR_B5: "nir"});   // Landsat: nir08 is the NIR band when nothing else is called nir
-        expect(itemBandNames(pc, "asset-key")).toEqual({B04: "B04", B08: "B08", SR_B5: "SR_B5", SCL: "SCL"});
-        expect(assetBands(pc.assets.SCL)).toEqual([{name: "SCL", scale: 1, nodata: 0}]);
-        // Shared common names are ambiguous: Sentinel-2's three red-edge bands are all "rededge".
-        const edges = item("E", {}, undefined, Object.fromEntries(["B05", "B06", "B07"].map((k) =>
-            [k, {href: `https://x/${k}.tif`, type: "image/tiff", "eo:bands": [{common_name: "rededge"}]}])));
-        expect(itemBandNames(edges)).toEqual({B05: "B05", B06: "B06", B07: "B07"});
-    });
-
-    it("opens only the assets a style reads, signs what needs it, and refuses unreadable assets", () => {
-        const inputs = toBandInputs(s2, {style: {render: {type: "pseudocolor", expression: "(nir - red) / (nir + red)"}, mask: [{band: "scl", values: [9]}]}});
-        expect(inputs.map((i) => [i.bands, i.resampling])).toEqual([["red", "bilinear"], ["nir", "bilinear"], ["scl", "nearest"]]);
-        expect(inputs[0]).toMatchObject({url: "https://e84.test/B04.tif", scale: 0.0001, offset: -0.1, nodata: 0, sign: undefined});
+    it("says which assets need signing and which a browser cannot read", () => {
+        expect(resolveAsset(s2, "red")).toMatchObject({href: "https://e84.test/B04.tif", readable: "yes"});
         expect(resolveAsset(pc, "B04").readable).toBe("signed");
         expect(resolveAsset(pc, "SR_B5")).toMatchObject({readable: "no", reason: "requester-pays storage"});
-        expect(() => toBandInputs(pc, {assets: ["SR_B5"]})).toThrow(/cannot be read from a browser/);
-        expect(toBandInputs(pc, {assets: ["B04"], rename: (b) => `${b}_2024`})[0].bands).toBe("red_2024");
+        expect(assetBands(pc.assets.SCL)).toEqual([{name: "SCL", scale: 1, nodata: 0}]);
     });
 
-    it("handles multiband assets: names from common names, or given per asset", () => {
-        const naip = item("NAIP", {}, undefined, {image: {href: "https://x/naip.tif", type: "image/tiff", roles: ["data"],
-            "eo:bands": [{name: "Red", common_name: "red"}, {common_name: "green"}, {common_name: "blue"}, {name: "NIR", common_name: "nir"}]}});
-        expect(toBandInputs(naip)[0].bands).toEqual(["red", "green", "blue", "nir"]);
-        expect(toBandInputs(naip, {style: {render: {type: "pseudocolor", band: "nir"}}}).length).toBe(1);
-        const cbers = item("CB", {}, undefined, {tci: {href: "https://x/tci.tif", type: "image/tiff", roles: ["data"]}});
-        expect(toBandInputs(cbers, {assets: ["tci"], bandNames: {tci: ["red", "green", "blue"]}, rename: (b) => `${b}_2026`})[0].bands)
-            .toEqual(["red_2026", "green_2026", "blue_2026"]);
-    });
-
-        it("decides class bands from metadata first, then a key fallback, and lets you override", () => {
-        const it = item("C", {}, undefined, {
-            map: {href: "https://x/map.tif", type: "image/tiff", "classification:classes": [{value: 10}]},
-            qa: {href: "https://x/qa.tif", type: "image/tiff", roles: ["cloud", "cloud-shadow"]},
-            scl: {href: "https://x/scl.tif", type: "image/tiff", roles: ["data"]},
-            red: {href: "https://x/red.tif", type: "image/tiff", "eo:bands": [{common_name: "red"}]},
-        });
-        expect(toBandInputs(it).map((i) => [i.bands, i.resampling])).toEqual([["map", "nearest"], ["qa", "nearest"], ["scl", "nearest"], ["red", "bilinear"]]);
-        expect(toBandInputs(it, {resampling: {scl: "bilinear"}}).find((i) => i.bands === "scl")!.resampling).toBe("bilinear");
-    });
-
-        it("signs Planetary Computer URLs with a cached token", async () => {
+    it("signs Planetary Computer URLs with a cached token", async () => {
         const fetchMock = vi.fn(async () => new Response(JSON.stringify({token: "st=1&se=2&sig=abc", "msft:expiry": new Date(Date.now() + 3600_000).toISOString()})));
         vi.stubGlobal("fetch", fetchMock);
         const sign = planetaryComputerSigner("https://pc.test/token");

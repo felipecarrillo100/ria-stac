@@ -3,15 +3,14 @@
  * they were given for, with redirects to another origin refused.
  */
 import type {HttpRequestHeaders, HttpRequestParameters, HttpRequestOptions} from "@luciad/ria/util/HttpRequestOptions.js";
-import {BaseClient, BaseResponse} from "geotiff";
 
 /**
- * What a request is for, as passed to an {@link AccessHook}: `"file"` (a GeoTIFF or `.prj` file), `"manifest"`,
- * `"stac-api"` (STAC API, catalog and item documents), `"stac-asset"` (a STAC asset), or `"source"` (the requests
- * of {@link identifySource}, made before the kind of the URL is known).
+ * What a request is for, as passed to an {@link AccessHook}: `"stac-api"` (STAC API, catalog, collection and item
+ * documents) or `"stac-asset"` (a STAC asset). A hook written for a library with more kinds (ria-geotiff's also has
+ * `"file"`, `"manifest"` and `"source"`) can be passed as it is.
  *
  * @category Protected data */
-export type AccessKind = "file" | "manifest" | "stac-api" | "stac-asset" | "source";
+export type AccessKind = "stac-api" | "stac-asset";
 
 /**
  * Decides per request which credentials, headers and parameters to send, replacing the library's rule (options only
@@ -123,18 +122,18 @@ export async function accessFetch(url: string, access: HttpRequestOptions | null
 }
 
 /**
- * A request the library made, as given to an `onRequest` listener (of `GeoTiffTileSetModel.create`,
- * `identifySource`, `probeCog`, `readManifest` and `StacClient`): for logs, request counters and progress.
+ * A request the library made, as given to an `onRequest` listener of {@link StacClient}: for logs, request counters
+ * and progress.
  *
- * `url` is the URL as the application gave it or the library found it: without the added `requestParameters`, without
- * signing (Planetary Computer tokens) and before `rewriteUrl`. Headers and credentials are never reported.
+ * `url` is the URL as the application gave it or the library found it: without the added `requestParameters`,  and without
+ * signing (Planetary Computer tokens). Headers and credentials are never reported.
  *
  * @category Protected data
  */
-export interface RiaGeoTiffRequest {
+export interface RiaStacRequest {
     /** The URL, without secrets (see above). */
     url: string;
-    /** What was requested: a GeoTIFF or `.prj` file, a manifest, a STAC API document, a STAC asset, or an identified source. */
+    /** What was requested: a STAC API document or a STAC asset. */
     kind: AccessKind;
     /** `"GET"` or `"POST"`. */
     method: string;
@@ -149,16 +148,16 @@ export interface RiaGeoTiffRequest {
 }
 
 /**
- * Receives every request a model, `identifySource`, `probeCog`, `readManifest` or `StacClient` makes; see
- * {@link RiaGeoTiffRequest}. Errors thrown by the listener are logged and ignored.
+ * Receives every request a {@link StacClient} makes; see
+ * {@link RiaStacRequest}. Errors thrown by the listener are logged and ignored.
  *
  * @category Protected data
  */
-export type RiaGeoTiffRequestListener = (request: RiaGeoTiffRequest) => void;
+export type RiaStacRequestListener = (request: RiaStacRequest) => void;
 
 /** What {@link accessFetch} reports, and to whom. @internal */
 export interface Observe {
-    onRequest?: RiaGeoTiffRequestListener;
+    onRequest?: RiaStacRequestListener;
     kind: AccessKind;
     /** The URL to report (without signing or rewriting); default the URL requested. */
     url?: string;
@@ -183,50 +182,6 @@ async function accessFetchOnce(url: string, access: HttpRequestOptions | null, i
     throw new Error(`Too many redirects from ${url}`);
 }
 
-class AccessResponse extends BaseResponse {
-    constructor(private readonly response: Response) {
-        super();
-    }
-
-    override get status(): number {
-        return this.response.status;
-    }
-
-    override getHeader(name: string): string | undefined {
-        return this.response.headers.get(name) ?? undefined;
-    }
-
-    override async getData(): Promise<ArrayBuffer> {
-        return this.response.arrayBuffer();
-    }
-}
-
-/**
- * A geotiff.js client whose options are read on every request (so renewed tokens are used at once), with the
- * redirect rule of {@link accessFetch}.
- *
- * @internal
- *
- * @category Protected data
- */
-export class AccessClient extends BaseClient {
-    constructor(url: string, private readonly accessOf: () => HttpRequestOptions | null, private readonly observe?: Observe) {
-        super(url);
-    }
-
-    /** The last refused redirect (geotiff.js does not pass request errors on). */
-    withheld: RedirectWithheldError | null = null;
-
-    override async request(options: RequestInit = {}): Promise<BaseResponse> {
-        try {
-            return new AccessResponse(await accessFetch(this.url, this.accessOf(), {headers: options.headers, signal: options.signal}, fetch, this.observe));
-        } catch (e) {
-            if (e instanceof RedirectWithheldError) this.withheld = e;
-            throw e;
-        }
-    }
-}
-
 /**
  * Header values replaced by `<redacted>`, for display.
  *
@@ -237,13 +192,3 @@ export class AccessClient extends BaseClient {
 export function redactHeaders(headers: HttpRequestHeaders | null | undefined): Record<string, string> {
     return Object.fromEntries(Object.keys(headers ?? {}).map((k) => [k, "<redacted>"]));
 }
-
-/**
- * How an input that the library found (not one the application gave) gets options: only on `origin` (a manifest's
- * own server), or through `hook` (STAC `assetAccess`); with neither, none.
- *
- * @internal
- *
- * @category Protected data
- */
-export const discoveredInputs = new WeakMap<object, { kind: AccessKind; origin: string | null; hook?: AccessHook }>();

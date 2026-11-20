@@ -7,7 +7,7 @@ import {assetBands, isDataAsset, type BandDescriptor} from "./bands.js";
 import {emptyProfile, parseCapabilities, type ServerProfile, type StacCapabilities} from "./capabilities.js";
 import type {Bbox, StacCatalogJson, StacCollectionJson, StacItemCollectionJson, StacItemJson, StacLink} from "./json.js";
 import type {HttpRequestHeaders, HttpRequestParameters} from "@luciad/ria/util/HttpRequestOptions.js";
-import {accessFetch, originOf, type AccessHook, type RiaGeoTiffRequestListener} from "../http.js";
+import {accessFetch, originOf, type AccessHook, type RiaStacRequestListener} from "./http.js";
 import {codeOf, itemMatches, planSearch, type Degradation, type QueryablesSchema, type FilterEncoding, type HttpRequestSpec, type SearchPlan, type StacSearchRequest} from "./plan.js";
 import type {Cql2Json} from "./cql2.js";
 import {bboxesIntersect, bboxOf, isGlobalBbox} from "./geometry.js";
@@ -17,7 +17,7 @@ import {absolutize} from "./links.js";
 import {collectionItemsPlan, crawlCollections, crawlItems, staticPlan} from "./static.js";
 import {checkSelection, selectItems, summarise, type CollectionDetails, type CollectionSummary, type Pick,
     type StacSelection, type StacSelectionResult} from "./catalog.js";
-import {RiaGeoTiffError, type RiaGeoTiffProblem} from "../errors.js";
+import {RiaStacError, type RiaStacProblem} from "./errors.js";
 
 /** Options of {@link StacClient.connect}. All are optional.
  *
@@ -28,9 +28,9 @@ export interface StacClientOptions {
     /**
      * Called after every request of the client (kind `"stac-api"`: landing page, conformance, collections,
      * queryables, searches, crawled documents), with the URL as requested before `rewriteUrl` and without the
-     * added `requestParameters`; see {@link "ria-geotiff"!RiaGeoTiffRequest | RiaGeoTiffRequest}.
+     * added `requestParameters`; see {@link RiaStacRequest}.
      */
-    onRequest?: RiaGeoTiffRequestListener;
+    onRequest?: RiaStacRequestListener;
     /**
      * Cookies and HTTP authentication of API requests, as LuciadRIA's option: `true` = `"include"`, `false` or
      * unset = `"same-origin"`, or a fetch mode.
@@ -219,7 +219,7 @@ export interface StacProgress {
  * cannot succeed, with its problems.
  *
  * Errors of {@link StacClient.select} (and of `GeoTiffTileSetModel.create({stac: {catalog, ...}})`) about the selection
- * itself have {@link "ria-geotiff"!RiaGeoTiffError.problems | problems}: those of {@link StacClient.check}, and, when
+ * itself have {@link RiaStacError.problems | problems}: those of {@link StacClient.check}, and, when
  * no item is left, one warning per requirement that excluded items. Those errors have no `status`. Request errors
  * have an empty `problems` list.
  *
@@ -230,7 +230,7 @@ export interface StacProgress {
  * signal's reason (an `AbortError` `DOMException` by default), not with a `StacError`.
  *
  * @category Errors */
-export class StacError extends RiaGeoTiffError {
+export class StacError extends RiaStacError {
     /**
      * Creates an error; the client throws these, applications rarely need to.
      *
@@ -242,7 +242,7 @@ export class StacError extends RiaGeoTiffError {
      *   Default none.
      */
     constructor(message: string, readonly status?: number, readonly url?: string, readonly body?: unknown,
-        problems: RiaGeoTiffProblem[] = []) {
+        problems: RiaStacProblem[] = []) {
         super(message, problems);
         this.name = "StacError";
     }
@@ -852,7 +852,7 @@ export class StacClient {
      * for (const p of catalog.check(selection, collection)) console.log(p.severity, p.path, p.message);
      * ```
      */
-    check(selection: StacSelection, collection?: CollectionDetails): RiaGeoTiffProblem[] {
+    check(selection: StacSelection, collection?: CollectionDetails): RiaStacProblem[] {
         return checkSelection(selection, collection ?? this._details.get(selection.collection));
     }
 
