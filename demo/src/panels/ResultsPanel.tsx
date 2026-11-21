@@ -1,12 +1,12 @@
 import {useEffect} from "react";
 import {Alert, Box, Button, ButtonGroup, Checkbox, Chip, FormControlLabel, LinearProgress, List, ListItemButton, Stack, Switch, Tooltip, Typography} from "@mui/material";
 import DownloadIcon from "@mui/icons-material/Download";
-import HideImageOutlinedIcon from "@mui/icons-material/HideImageOutlined";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import ChevronLeftIcon from "@mui/icons-material/ChevronLeft";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import {itemKey, itemMediaTypes, type StacItemJson} from "ria-stac";
 import {formatOf} from "../formats.js";
+import {Thumbnail} from "../components/Thumbnail.js";
 import {DISPLAY_PAGE, explorer, shownItems, useExplorer} from "../state/explorer.js";
 import {cloudOf, dateOf, explainError, thumbnailOf} from "../util.js";
 
@@ -30,11 +30,7 @@ function Row({item}: { item: StacItemJson }) {
                 ...(s.hoveredItem === key ? {outline: "1px solid", outlineColor: "warning.main"} : {})}}>
             <Checkbox size="small" checked={chosen} sx={{p: 0.5, mt: 1.25}} slotProps={{input: {"aria-label": `Select ${item.id}`}}}
                 onClick={(e) => { e.stopPropagation(); explorer.toggleChosen(key); }}/>
-            <Box sx={{width: 52, height: 52, flex: "none", borderRadius: 1, bgcolor: "rgba(148,163,184,0.1)", overflow: "hidden", display: "grid", placeItems: "center"}}
-                title={thumb ? undefined : "No preview: the item has no thumbnail a browser can show"}>
-                {thumb ? <img src={thumb} alt="" loading="lazy" style={{width: "100%", height: "100%", objectFit: "cover"}}/>
-                    : <HideImageOutlinedIcon sx={{color: "text.disabled", fontSize: 20}}/>}
-            </Box>
+            <Thumbnail src={thumb}/>
             <Box sx={{minWidth: 0, flex: 1}}>
                 <Typography variant="body2" sx={{fontWeight: 600}}>{dateOf(item).replace("T", " ").slice(0, 16) || "no date"}</Typography>
                 <Typography variant="caption" color="text.secondary" component="div" noWrap sx={{fontFamily: "JetBrains Mono, monospace"}}>{item.id}</Typography>

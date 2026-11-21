@@ -128,7 +128,7 @@ export function DetailsDrawer({onZoom}: { onZoom: (b: [number, number, number, n
             <Box sx={{p: 2, overflow: "auto", flex: 1}}>
                 {tabs[t] === "Overview" && (
                     <Stack spacing={1.5}>
-                        {thumb && <img src={thumb} alt="Preview" style={{width: "100%", borderRadius: 8}}/>}
+                        {thumb && <img src={thumb} alt="Preview" style={{width: "100%", borderRadius: 8}} onError={(e) => { e.currentTarget.style.display = "none"; }}/>}
                         {item ? <Typography variant="body2">{dateOf(item).replace("T", " ").slice(0, 19)} · {item.collection}</Typography>
                             : <Typography variant="body2" color="text.secondary" sx={{whiteSpace: "pre-wrap"}}>{(collection!.description ?? "").slice(0, 800)}</Typography>}
                         {collection?.license && <Typography variant="caption">License: {collection.license}</Typography>}
