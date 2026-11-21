@@ -2,6 +2,55 @@
 
 ## 0.1.0 (unreleased)
 
+### Media types instead of formats (2026-11-21)
+
+Breaking, before the first release: the library names assets by their media type (STAC asset `type`), as the
+standard does, and leaves names for people ("COG", "GeoTIFF") to applications.
+
+- Renamed: `assetFormat` → `assetMediaType` (`{mediaType, inferred}`), `itemFormats` → `itemMediaTypes`,
+  `formatsFilter` → `mediaTypesFilter`, the client-side CQL2 property `asset_formats` → `asset_media_types`
+  (`ASSET_MEDIA_TYPES`), `collectionFormats` → `collectionMediaTypes` (`CollectionMediaTypes`, with `untyped`
+  keys and an `inferred` flag per media type), `StacSelection.formats` → `mediaTypes`, and
+  `CollectionDescription.assets[].format` → `mediaType`. `AssetFormat` and the format names are gone.
+- `normaliseMediaType`: one spelling per media type (case, spaces, quotes and parameter order do not matter, as in
+  RFC 6838). Media types are compared in that spelling and otherwise exactly: `image/tiff; application=geotiff`
+  does not match a COG.
+- An asset without `type` gets the media type of its file extension (`.tif` → `image/tiff`), marked `inferred`.
+- `CollectionSummary.mediaTypes` and `mediaTypeSource`: the media types of `item_assets`, with no request.
+- `mediaTypeMatch(known, wanted)`: `"match"`, `"no-match"` (only when `item_assets` say so), `"not-in-sample"`
+  (the items read have none, others may) or `"unknown"`.
+- `CollectionFilter.mediaTypes` (with `mediaTypesUnsure: "keep" | "drop"`, default keep): drops only the
+  collections known not to match. Tested in the client; no server filters collections on asset media types.
+
+### Excluded periods and time extents (2026-11-21)
+
+- `exceptDatetime` on search requests, selections and collection filters: periods to leave out, in the forms of
+  `datetime` (open ends allowed). STAC's `datetime` takes one interval only, so they go as a CQL2 filter:
+  - The server gets `datetime < a OR end_datetime < a OR datetime > b` per period, ANDed with the other
+    predicates: basic CQL2 on `datetime` and `end_datetime` only, because Planetary Computer (pgstac) answers HTTP
+    500 to `start_datetime` and `IS NULL`. It is exact for items with an instant.
+  - The client then tests the exact rule on every item (an item is left out when its span overlaps a period;
+    `exceptFilter` gives it as CQL2), which covers items with a span, servers without CQL2, the Query extension
+    and static catalogs. Verification of the server's filter does not count these items as violations.
+  - Collections are left out when their whole declared period lies inside an excluded one.
+  - `check` reports a period open at both ends, and one that covers the whole of `datetime`.
+- `timeExtent(collections?, {exact, area})`: the time span to offer in a period picker. Declared periods (their
+  union), widened by the items read, and with `exact` the first and last items of a sorted search; each end says
+  where it comes from and whether the data goes on (`openEnd`).
+- `seenTimeExtent(collections?)`: the earliest and latest times of every item the client has read (searches,
+  crawls, `dateRange`), with no request.
+- `dateRange` ignores `exceptDatetime` as it ignores `datetime`.
+
+### No format preference (2026-11-20)
+
+- ria-stac prefers no format; which formats matter is the application's or the user's choice:
+  - `select()` keeps every item by default. `formats` takes any names `assetFormat` gives (`"COG"`, `"JPEG 2000"`,
+    `"Zarr"`, `"XYZ (zipped)"`, ...).
+  - `isDataAsset` is any asset that holds data (not thumbnails, overviews, previews or metadata), whatever its
+    format.
+  - `CollectionDescription.assets` lists them all, each with its `format`.
+  - `AssetFormat` loses `openable`, which belonged to ria-geotiff, and gains `zipped`.
+
 ### Band naming (2026-11-20)
 
 - Band naming (evidence: `spikes/BAND-NAMING.md` of ria-stac, nine real collections): names stay roles first (EO

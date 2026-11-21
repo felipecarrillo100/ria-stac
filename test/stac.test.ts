@@ -3,7 +3,7 @@ import {afterEach, describe, expect, it, vi} from "vitest";
 import {COLLECTION_PAGE_SIZE, isGlobalBbox, SELECT_PAGE_SIZE, 
     assetBands, bestPerPeriod, coverArea, dedupeItems, emptyProfile, evaluateCql2, groupItems,
     itemsCovering, normaliseDatetime, parseCapabilities, planetaryComputerSigner, planSearch, resolveAsset, sortItems,
-    StacClient, StacError, splitFilter, formatsFilter, toCql2Text, type StacItemJson,
+    StacClient, StacError, splitFilter, mediaTypesFilter, toCql2Text, type StacItemJson,
 } from "../src/index.js";
 
 // ------------------------------------------------------------------------------------------------ fixtures
@@ -157,17 +157,17 @@ describe("CQL2 on the server, by the classes it declares", () => {
         expect(new URL(sent.url).searchParams.get("filter")).toBe("(eo:cloud_cover < 20) AND (platform LIKE 'sentinel-%')");
     });
 
-    it("an asset-format filter stays on the client, beside a server-side comparison", async () => {
+    it("an asset media-type filter stays on the client, beside a server-side comparison", async () => {
         const cog = {data: {href: "https://x.test/a.tif", type: "image/tiff; application=geotiff; profile=cloud-optimized"}};
         const zip = {data: {href: "https://x.test/a.zip", type: "application/x.ascii-xyz+zip"}};
         const mixed = [item("cog", {"eo:cloud_cover": 1}, undefined, cog), item("zip", {"eo:cloud_cover": 1}, undefined, zip),
             item("cloudy", {"eo:cloud_cover": 90}, undefined, cog)];
         mockServer({conformsTo: basic, items: mixed});
         const client = await StacClient.connect("https://stac.test/v1");
-        const search = client.search({collections: ["s2"], where: {"eo:cloud_cover": {lt: 20}}, filter: formatsFilter(["COG"])});
+        const search = client.search({collections: ["s2"], where: {"eo:cloud_cover": {lt: 20}}, filter: mediaTypesFilter(["image/tiff; application=geotiff; profile=cloud-optimized"])});
         expect(ids(await search.collect())).toEqual(["cog"]);
         expect(search.plan.serverFilter).toEqual({op: "<", args: [{property: "eo:cloud_cover"}, 20]});
-        expect(search.plan.clientFilter).toEqual(formatsFilter(["COG"]));
+        expect(search.plan.clientFilter).toEqual(mediaTypesFilter(["image/tiff; application=geotiff; profile=cloud-optimized"]));
     });
 
     it("select asks for large pages, and keeps the items of earlier pages when a later one fails", async () => {

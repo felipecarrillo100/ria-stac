@@ -255,33 +255,40 @@ describe("OGC API - Features without item search", () => {
         return json({}, 404);
     }));
 
-    it("select skips items without a GeoTIFF data asset, so they do not use up maxItems", async () => {
+    it("select keeps every media type by default, and with mediaTypes skips items without one, so they do not use up maxItems", async () => {
         const zipped = (id: string) => ({...boxItem(id, [15, 45, 15.1, 45.1], "2024-06-01T00:00:00Z"),
             assets: {xyz: {href: `https://x.test/${id}.xyz.zip`, type: "application/x.ascii-xyz+zip"}}});
         const original = [...items];
+        const COG = "image/tiff; application=geotiff; profile=cloud-optimized", TIFF = "image/tiff; application=geotiff";
         try {
             // The stub serves two pages of two: the COG comes after three zipped tiles, beyond maxItems: 2.
             items.splice(0, items.length, zipped("z1"), zipped("z2"), zipped("z3"), boxItem("cog", [14.9, 44.9, 15.2, 45.2], "2024-05-28T00:00:00Z"));
             stubFeatures([]);
             const client = await StacClient.connect("https://features.test");
-            const result = await client.select({collection: "s2", area: [15, 45, 15.1, 45.1], maxItems: 2, pick: {coverage: "best"}});
+            // No media type preferred: the zipped tiles count like any other item.
+            const all = await client.select({collection: "s2", area: [15, 45, 15.1, 45.1], maxItems: 2, pick: {coverage: "best"}});
+            expect(all).toMatchObject({found: 2, skipped: 0});
+            const result = await client.select({collection: "s2", area: [15, 45, 15.1, 45.1], maxItems: 2, mediaTypes: [COG, TIFF], pick: {coverage: "best"}});
             expect(result.items.map((i) => i.id)).toEqual(["cog"]);
             expect(result).toMatchObject({found: 1, skipped: 3});
             expect(result.candidates.map((c) => c.item.id)).toEqual(["cog"]);
             expect(result).toMatchObject({scanned: 4, truncated: false});
             // maxScanned stops the search before the COG: said in the error, with advice in its problems.
-            const stopped = await client.select({collection: "s2", area: [15, 45, 15.1, 45.1], maxScanned: 2}).catch((e: StacError) => e);
+            const stopped = await client.select({collection: "s2", area: [15, 45, 15.1, 45.1], maxScanned: 2, mediaTypes: [COG, TIFF]}).catch((e: StacError) => e);
             expect((stopped as StacError).message).toMatch(/stopped after reading 2 items \(maxScanned\)/);
-            expect((stopped as StacError).problems).toContainEqual(expect.objectContaining({path: "formats", message: expect.stringMatching(/narrow the area or the period/)}));
-            // formats: ["COG"] skips a GeoTIFF without the COG profile; an unopenable format is refused.
+            expect((stopped as StacError).problems).toContainEqual(expect.objectContaining({path: "mediaTypes", message: expect.stringMatching(/narrow the area or the period/)}));
+            // mediaTypes: [COG] skips a GeoTIFF without the COG profile; an unopenable format is refused.
             const plain = {...boxItem("plain", [14.9, 44.9, 15.2, 45.2], "2024-05-29T00:00:00Z"),
                 assets: {data: {href: "https://x.test/plain.tif", type: "image/tiff; application=geotiff"}}};
             items.splice(0, items.length, plain, boxItem("cog", [14.9, 44.9, 15.2, 45.2], "2024-05-28T00:00:00Z"));
-            const cogs = await client.select({collection: "s2", area: [15, 45, 15.1, 45.1], formats: ["COG"], pick: {coverage: "best"}});
+            const cogs = await client.select({collection: "s2", area: [15, 45, 15.1, 45.1], mediaTypes: [COG], pick: {coverage: "best"}});
             expect(cogs).toMatchObject({found: 1, skipped: 1});
-            await expect(client.select({collection: "s2", formats: ["ZIP" as "COG"]})).rejects.toThrow(/formats must list "COG", "GeoTIFF" or both/);
+            // Any media type works, and an empty list is refused.
+            items.splice(0, items.length, zipped("z1"), zipped("z2"), boxItem("cog", [14.9, 44.9, 15.2, 45.2], "2024-05-28T00:00:00Z"));
+            expect((await client.select({collection: "s2", area: [15, 45, 15.1, 45.1], mediaTypes: ["application/x.ascii-xyz+zip"], pick: {coverage: "best"}})).items.every((i) => i.id.startsWith("z"))).toBe(true);
+            await expect(client.select({collection: "s2", mediaTypes: []})).rejects.toThrow(/mediaTypes must list at least one media type/);
             items.splice(0, items.length, zipped("z1"), zipped("z2"));
-            await expect(client.select({collection: "s2", area: [15, 45, 15.1, 45.1]})).rejects.toThrow(/2 more had no COG or GeoTIFF asset/);
+            await expect(client.select({collection: "s2", area: [15, 45, 15.1, 45.1], mediaTypes: [COG, TIFF]})).rejects.toThrow(/2 more had no asset of type image\/tiff; application=geotiff; profile=cloud-optimized or image\/tiff; application=geotiff and were skipped/);
         } finally {
             items.splice(0, items.length, ...original);
         }

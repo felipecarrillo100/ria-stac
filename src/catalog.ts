@@ -5,9 +5,9 @@
  * 2. `check(selection, collection)`: problems found before any search; `select(selection)`: search and pick items.
  */
 import type {RiaStacProblem} from "./errors.js";
-import {nameAssetBands} from "./bands.js";
-import {cql2Predicate, formatsFilter} from "./cql2.js";
-import {StacError, type CollectionDescription, type Queryable, type StacClient} from "./client.js";
+import {nameAssetBands, normaliseMediaType} from "./bands.js";
+import {cql2Predicate, mediaTypesFilter} from "./cql2.js";
+import {StacError, type CollectionDescription, type CollectionMediaTypes, type Queryable, type StacClient} from "./client.js";
 import type {Cql2Json, WhereComparison} from "./cql2.js";
 import {bboxOf, bboxesIntersect, coverageOf} from "./geometry.js";
 import type {Bbox, GeoJsonArea, StacCollectionJson, StacItemJson} from "./json.js";
@@ -43,6 +43,14 @@ export interface CollectionSummary {
     keywords?: string[];
     /** Longer description (CommonMark), when given: free text to search in. */
     description?: string;
+    /**
+     * Media types of the data assets declared in the collection's `item_assets`, canonically spelled (see
+     * `normaliseMediaType`), each once; empty without `item_assets` (then `mediaTypeSource` is `"none"`, and the
+     * media types are known only from items: see {@link StacClient.collectionMediaTypes}).
+     */
+    mediaTypes: string[];
+    /** Where `mediaTypes` comes from: the collection's `item_assets`, or nowhere. */
+    mediaTypeSource: "item_assets" | "none";
 }
 
 /** A collection in detail, see {@link StacClient.collection}: the summary plus queryables, assets and the JSON.
@@ -80,6 +88,8 @@ export interface StacSelection {
      * 2026, and `[start, null]` is open at the end. Dates without a time zone are taken as UTC.
      */
     datetime?: string | [string | null, string | null];
+    /** Periods to leave out, as {@link StacSearchRequest.exceptDatetime}. */
+    exceptDatetime?: (string | [string | null, string | null])[];
     /**
      * Band roles you need (`["red", "nir"]`). {@link StacClient.check} reports roles the collection does not offer;
      * the search itself does not use them, and neither does the model: it has every band of the items.
@@ -105,20 +115,22 @@ export interface StacSelection {
      * requests {@link SELECT_PAGE_SIZE} items per page (the server or the profile may lower it), so 400 items cost
      * one request where the server allows it. More items give the pick more to choose from, and take longer to
      * read and to score. `select` counts only items
-     * with an asset in one of `formats`: it skips the others (zipped or vector downloads, see `skipped`) and reads
+     * with an asset of one of `mediaTypes`: it skips the others (zipped or vector downloads, see `skipped`) and reads
      * on, up to `maxScanned` items in all.
      */
     maxItems?: number;
     /**
-     * The asset formats an item must have one of, as `assetFormat` names them: `"COG"`, `"GeoTIFF"` (a
-     * GeoTIFF without the COG profile in its media type), or both (the default). Tested on the client with the
-     * CQL2 filter `A_OVERLAPS(asset_formats, (...))` (see `formatsFilter`): no server can filter on asset formats.
-     * Items without one are skipped (see {@link StacSelectionResult.skipped}). It selects items, not assets: a
-     * model opens every GeoTIFF data asset of the items picked.
+     * The media types (STAC asset `type`) an item must have a data asset of, for example
+     * `["image/tiff; application=geotiff; profile=cloud-optimized"]`. Compared canonically spelled and otherwise
+     * exactly (see `normaliseMediaType`; assets without `type` count by the media type of their file extension, see
+     * `assetMediaType`), so list every media type wanted. Default: none, every item counts, whatever its assets. When
+     * given, it is tested on the client with the CQL2 filter `A_OVERLAPS(asset_media_types, (...))` (see
+     * `mediaTypesFilter`), since no server filters on asset media types; items without one of them are skipped (see
+     * {@link StacSelectionResult.skipped}) and the search reads on. It selects items, not assets.
      */
-    formats?: ("COG" | "GeoTIFF")[];
+    mediaTypes?: string[];
     /**
-     * How many items the search reads at most, counting those skipped for their formats. Default
+     * How many items the search reads at most, counting those skipped for their media types. Default
      * {@link SELECT_SCAN_LIMIT} (10000, about 100 requests of 100). The search stops sooner when `maxItems`
      * items are kept, so this costs only when most items are skipped, as in collections that list zipped tiles
      * beside one COG.
@@ -183,18 +195,17 @@ export interface StacSelectionResult {
      * {@link periodOf}. `items` holds the items of these periods in the same order.
      */
     periods?: string[];
-    /** Number of items the search returned with a GeoTIFF data asset (at most `maxItems`), before `pick` filtered them. */
+    /** Number of items the search returned (with an asset of one of `mediaTypes`, when given; at most `maxItems`), before `pick` filtered them. */
     found: number;
     /**
-     * Items the search returned without an asset in one of `formats` (zipped files, vector or text downloads, or
-     * GeoTIFFs without the COG profile when `formats` is `["COG"]`): skipped, so that they do not use up
-     * `maxItems`, and not listed in `candidates`.
+     * Items the search returned without an asset of one of `mediaTypes` (0 without `mediaTypes`): skipped, so that they
+     * do not use up `maxItems`, and not listed in `candidates`.
      */
     skipped: number;
     /** Items read from the server, kept or not. */
     scanned: number;
     /**
-     * Whether the search stopped at `maxScanned` items read before `maxItems` were kept: more items in `formats`
+     * Whether the search stopped at `maxScanned` items read before `maxItems` were kept: more items of `mediaTypes`
      * may lie beyond. Narrow the area or the period, or raise `maxScanned`.
      */
     truncated: boolean;
@@ -327,6 +338,52 @@ export function collectionBands(description: CollectionDescription): string[] {
 }
 
 /**
+ * How a collection's media types compare with the ones wanted, see {@link mediaTypeMatch}.
+ *
+ * @category Choosing data
+ */
+export type MediaTypeMatch = "match" | "no-match" | "not-in-sample" | "unknown";
+
+/**
+ * Whether a collection has data assets of one of the wanted media types, as far as is known.
+ *
+ * - `"match"`: one of them was found, in `item_assets` or in the items read (or nothing is wanted).
+ * - `"no-match"`: the collection declares `item_assets` and none of them has one: known not to match.
+ * - `"not-in-sample"`: the items read have none, but other items may: assets can vary from item to item, and a
+ *   sample shows which media types exist, not which do not.
+ * - `"unknown"`: nothing tells yet (no `item_assets` and no items read, or a collection without items).
+ *
+ * A filter that removes only `"no-match"` never hides a collection that might match. Media types are compared
+ * canonically spelled (see `normaliseMediaType`) and otherwise exactly.
+ *
+ * @param known What is known of the collection: its summary (from `item_assets`, no request), the result of
+ *   `collectionMediaTypes` (from `item_assets` or items read), or nothing yet.
+ * @param wanted The media types wanted.
+ * @returns The verdict.
+ * @example
+ * ```ts
+ * const cog = "image/tiff; application=geotiff; profile=cloud-optimized";
+ * const list = await client.collections();
+ * const unsure = list.filter((c) => mediaTypeMatch(c, [cog]) === "unknown");
+ * const sampled = await Promise.all(unsure.map((c) => client.collectionMediaTypes(c.id)));
+ * ```
+ *
+ * @category Choosing data
+ */
+export function mediaTypeMatch(known: CollectionSummary | CollectionMediaTypes | null | undefined, wanted: readonly string[]): MediaTypeMatch {
+    if (!wanted.length) return "match";
+    if (!known) return "unknown";
+    const want = new Set(wanted.map(normaliseMediaType));
+    if ("mediaTypeSource" in known) {
+        if (known.mediaTypeSource === "none") return "unknown";
+        return known.mediaTypes.some((t) => want.has(t)) ? "match" : "no-match";
+    }
+    if (known.source === "none") return "unknown";
+    const found = known.mediaTypes.some((t) => want.has(t.mediaType));
+    return found ? "match" : known.source === "item_assets" ? "no-match" : "not-in-sample";
+}
+
+/**
  * A collection description as a summary.
  *
  * @internal
@@ -339,6 +396,8 @@ export function summarise(d: CollectionDescription): CollectionSummary {
         bandNaming: d.assets.some((a) => a.bands.some((b) => b.commonName !== undefined)) ? "common-names"
             : d.assets.length ? "asset-keys" : "none",
         keywords: d.keywords, description: d.description,
+        mediaTypes: [...new Set(d.assets.map((a) => a.mediaType).filter((t): t is string => t !== null))],
+        mediaTypeSource: d.assets.length ? "item_assets" : "none",
     };
 }
 
@@ -368,6 +427,17 @@ export function checkSelection(selection: StacSelection, collection: CollectionD
             problems.push({path: "datetime", severity: "error", message: `outside the collection's period ${collection.interval[0] ?? ".."} – ${collection.interval[1] ?? ".."}`});
         }
     }
+    selection.exceptDatetime?.forEach((p, i) => {
+        const e = normaliseDatetime(p);
+        if (e === "../..") problems.push({path: `exceptDatetime.${i}`, severity: "error", message: "a period open at both ends leaves out every item"});
+        else if (dt && e) {
+            const [a, b] = dt.includes("/") ? dt.split("/") : [dt, dt], [c, d] = e.includes("/") ? e.split("/") : [e, e];
+            const start = a === ".." ? -Infinity : Date.parse(a), end = b === ".." ? Infinity : Date.parse(b);
+            if ((c === ".." || Date.parse(c) <= start) && (d === ".." || Date.parse(d) >= end)) {
+                problems.push({path: `exceptDatetime.${i}`, severity: "error", message: "it leaves out the whole period of datetime"});
+            }
+        }
+    });
     if (selection.bands?.length) {
         const missing = selection.bands.filter((b) => !collection.bands.includes(b));
         if (!collection.bands.length || collection.bandNaming !== "common-names") {
@@ -437,13 +507,14 @@ export function selectionToRequest(selection: StacSelection): StacSearchRequest 
     return {
         collections: [selection.collection], ...(selection.area ? {area: selection.area} : {}),
         ...(selection.datetime !== undefined ? {datetime: selection.datetime} : {}),
+        ...(selection.exceptDatetime?.length ? {exceptDatetime: selection.exceptDatetime} : {}),
         ...(Object.keys(where).length ? {where} : {}), ...(selection.filter !== undefined ? {filter: selection.filter} : {}),
         limit: 100, maxItems: selection.maxItems ?? SELECT_MAX_ITEMS,
     };
 }
 
 /**
- * How many items in the chosen formats {@link StacClient.select} finds at most by default (see
+ * How many items of the chosen media types {@link StacClient.select} finds at most by default (see
  * {@link StacSelection.maxItems}): 400. The search stops there, so a selection matching more (a whole-world search,
  * a long period) is picked among the first 400 in the server's order.
  *
@@ -462,7 +533,7 @@ export const SELECT_MAX_ITEMS_LIMIT = 1000;
 
 /**
  * How many items {@link StacClient.select} reads at most by default (see {@link StacSelection.maxScanned}),
- * counting the ones it skips for their formats (see {@link StacSelectionResult.skipped}): 10000, about 100
+ * counting the ones it skips for their media types (see {@link StacSelectionResult.skipped}): 10000, about 100
  * requests of 100.
  *
  * @category Choosing data
@@ -498,16 +569,17 @@ export async function selectItems(client: StacClient, selection: StacSelection &
         throw new StacError(`The selection does not fit ${selection.collection}: ${errors.map((p) => `${p.path}: ${p.message}`).join("; ")}`,
             undefined, undefined, undefined, problems);
     }
-    // Only items with an asset in `formats` count towards maxItems: catalogs such as swisstopo's list thousands of
-    // zipped tiles beside the one COG, which would otherwise fill the result and hide it. No server filters on
-    // asset formats, so the CQL2 filter runs here, on every item read, and the search reads on up to maxScanned.
-    const formats = selection.formats ?? ["COG", "GeoTIFF"];
-    if (!formats.length || formats.some((f) => f !== "COG" && f !== "GeoTIFF")) {
-        const message = `must list "COG", "GeoTIFF" or both, the formats a model opens; got ${JSON.stringify(formats)}`;
-        throw new StacError(`The selection does not fit ${selection.collection}: formats ${message}`, undefined, undefined, undefined,
-            [...problems, {path: "formats", severity: "error", message}]);
+    // With `mediaTypes`, only items with an asset of one of them count towards maxItems: catalogs such as
+    // swisstopo's list thousands of zipped tiles beside one COG, which would otherwise fill the result. No server
+    // filters on asset media types, so the CQL2 filter runs here, on every item read, and the search reads on up to
+    // maxScanned. Without it every item counts: no media type is preferred.
+    const mediaTypes = selection.mediaTypes ?? [];
+    if (selection.mediaTypes !== undefined && (!mediaTypes.length || mediaTypes.some((f) => typeof f !== "string" || !f.trim()))) {
+        const message = `must list at least one media type, as STAC assets declare them in type; got ${JSON.stringify(mediaTypes)}`;
+        throw new StacError(`The selection does not fit ${selection.collection}: mediaTypes ${message}`, undefined, undefined, undefined,
+            [...problems, {path: "mediaTypes", severity: "error", message}]);
     }
-    const wanted = cql2Predicate(formatsFilter(formats));
+    const wanted = mediaTypes.length ? cql2Predicate(mediaTypesFilter(mediaTypes)) : () => true;
     const limit = selection.maxItems ?? SELECT_MAX_ITEMS;
     const maxScanned = selection.maxScanned ?? SELECT_SCAN_LIMIT;
     const request = {...selectionToRequest(selection), limit: SELECT_PAGE_SIZE, maxItems: maxScanned, maxScanned};
@@ -564,10 +636,10 @@ export async function selectItems(client: StacClient, selection: StacSelection &
         candidates = kept;
     }
     if (!candidates.length) {
-        const without = skipped ? `; ${skipped} more had no ${formats.join(" or ")} asset (zipped or vector downloads) and were skipped` : "";
+        const without = skipped ? `; ${skipped} more had no asset of type ${mediaTypes.join(" or ")} and were skipped` : "";
         const stopped = truncated ? `; the search stopped after reading ${scanned} items (maxScanned) and may have missed more` : "";
         throw new StacError(`No ${selection.collection} item meets the selection (${found.length} found by the search${without}${stopped})`,
-            undefined, undefined, undefined, [...problems, ...emptyReasons(found, [...records.values()], selection, search.rejected, {skipped, truncated, formats})]);
+            undefined, undefined, undefined, [...problems, ...emptyReasons(found, [...records.values()], selection, search.rejected, {skipped, truncated, mediaTypes})]);
     }
     const score = rankOf(pick.rank);
     const result = (items: StacItemJson[], dropped: StacSelectionResult["dropped"] = []): StacSelectionResult => {
@@ -599,12 +671,12 @@ export async function selectItems(client: StacClient, selection: StacSelection &
 
 /** When no item is left: one warning per rule that excluded items, saying what to relax. */
 function emptyReasons(found: StacItemJson[], records: StacCandidate[], selection: StacSelection & { pick?: Pick },
-    rejected: Record<string, number>, scan: { skipped: number; truncated: boolean; formats: string[] }): RiaStacProblem[] {
+    rejected: Record<string, number>, scan: { skipped: number; truncated: boolean; mediaTypes: string[] }): RiaStacProblem[] {
     if (!found.length && scan.skipped) {
-        // Items were found, in other formats: widening would only bring more of them.
-        return [{path: "formats", severity: "warning", message: scan.truncated
-            ? `none of the ${scan.skipped} item(s) read has a ${scan.formats.join(" or ")} asset, and the search stopped there: narrow the area or the period so it reaches further, or raise maxScanned`
-            : `none of the ${scan.skipped} item(s) found has a ${scan.formats.join(" or ")} asset: the collection holds no such item in this area and period`}];
+        // Items were found, with other media types: widening would only bring more of them.
+        return [{path: "mediaTypes", severity: "warning", message: scan.truncated
+            ? `none of the ${scan.skipped} item(s) read has an asset of type ${scan.mediaTypes.join(" or ")}, and the search stopped there: narrow the area or the period so it reaches further, or raise maxScanned`
+            : `none of the ${scan.skipped} item(s) found has an asset of type ${scan.mediaTypes.join(" or ")}: the collection holds no such item in this area and period`}];
     }
     if (!found.length) {
         // Requirements tested in the browser (static catalogs, items endpoints, client-side filters): how many items each excluded.

@@ -1,14 +1,15 @@
 import {readFileSync} from "node:fs";
 import {join} from "node:path";
 import {describe, expect, it} from "vitest";
-import {assetBands, isDataAsset, nameBands, resolveBandName, stableAssetKey, type NamedAsset, type StacItemJson} from "../src/index.js";
+import {assetBands, isDataAsset, isGeoTiffAsset, nameBands, resolveBandName, stableAssetKey, type NamedAsset, type StacItemJson} from "../src/index.js";
 import {FIXTURES} from "./helpers.js";
 
 /** Shared with ria-geotiff: real items and the names the rule must give them. */
 const {cases} = JSON.parse(readFileSync(join(FIXTURES, "band-naming.json"), "utf8")) as {
     cases: { source: string; item: StacItemJson; expected: NamedAsset[] }[];
 };
-const named = (item: StacItemJson) => nameBands(Object.keys(item.assets).filter((k) => isDataAsset(k, item.assets[k]))
+// The fixtures name the GeoTIFF data assets: the ones a ria-geotiff model is made of.
+const named = (item: StacItemJson) => nameBands(Object.keys(item.assets).filter((k) => isDataAsset(k, item.assets[k]) && isGeoTiffAsset(item.assets[k]))
     .map((key) => ({key, bands: assetBands(item.assets[key], item)})), {itemId: item.id});
 const names = (n: NamedAsset[]) => n.flatMap((a) => a.bands.map((b) => b.name));
 

@@ -24,7 +24,7 @@
   "sideEffects": false,
   "scripts": {
     "clean": "node -e \"require('fs').rmSync('lib',{recursive:true,force:true})\"",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit && tsc -p demo/tsconfig.json",
     "build": "npm run clean && tsc -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -32,7 +32,9 @@
     "verify": "npm run typecheck && npm test && npm run build && npm run lint",
     "prepublishOnly": "npm run verify",
     "docs": "typedoc",
-    "docs:check": "typedoc --emit none --treatValidationWarningsAsErrors"
+    "docs:check": "typedoc --emit none --treatValidationWarningsAsErrors",
+    "demo": "vite --config demo/vite.config.ts",
+    "demo:build": "vite build --config demo/vite.config.ts"
   },
   "keywords": [
     "stac",
@@ -61,10 +63,23 @@
     "ogc-cql2": "^1.7.0"
   },
   "devDependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@luciad/ria": "^2026.1.2",
+    "@mui/icons-material": "^9.5.0",
+    "@mui/material": "^9.5.0",
+    "@mui/x-date-pickers": "^9.18.0",
     "@types/node": "^22.20.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "dayjs": "^1.11.23",
     "publint": "^0.3.25",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "typedoc": "^0.28.20",
     "typescript": "~5.7.3",
+    "vite": "^7.3.8",
     "vitest": "^3.2.7"
   }
 }

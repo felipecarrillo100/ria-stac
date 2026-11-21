@@ -6,7 +6,7 @@
 import type {Cql2Filter} from "ogc-cql2";
 import {toPredicate, type EvaluateOptions} from "ogc-cql2/evaluate";
 import {toText} from "ogc-cql2/text";
-import {itemFormats} from "./bands.js";
+import {itemMediaTypes, normaliseMediaType} from "./bands.js";
 import type {StacItemJson} from "./json.js";
 
 /**
@@ -172,13 +172,13 @@ export function toCql2Text(e: Cql2Json): string {
 
 // ------------------------------------------------------------------------------------------------ evaluation
 
-/** Reads a property of an item for ogc-cql2: `properties.` prefix ignored; `id`, `collection` and `asset_formats` derived. */
+/** Reads a property of an item for ogc-cql2: `properties.` prefix ignored; `id`, `collection` and `asset_media_types` derived. */
 function itemProperty(item: StacItemJson, name: string): unknown {
     const key = name.replace(/^properties\./, "");
     if (key === "id") return item.id;
     if (key === "collection") return item.collection;
     const value = item.properties?.[key];
-    if (value === undefined && key === ASSET_FORMATS) return itemFormats(item);
+    if (value === undefined && key === ASSET_MEDIA_TYPES) return itemMediaTypes(item);
     return value;
 }
 
@@ -194,9 +194,9 @@ const OPTIONS: EvaluateOptions<StacItemJson> = {getProperty: itemProperty, query
  * {@link evaluateCql2} for each.
  *
  * Property references read `item.properties` (a `properties.` prefix is ignored), except `id` and `collection`,
- * which read the item, and `geometry`, the item's footprint. `asset_formats`, when the item has no such property,
- * is derived: the formats of its data assets (see {@link itemFormats}), for filters such as
- * `A_OVERLAPS(asset_formats, ('COG'))`. `datetime`, `start_datetime`, `end_datetime`, `created`, `updated`,
+ * which read the item, and `geometry`, the item's footprint. `asset_media_types`, when the item has no such
+ * property, is derived: the media types of its data assets (see {@link itemMediaTypes}), for filters such as
+ * `A_OVERLAPS(asset_media_types, ('image/tiff; application=geotiff; profile=cloud-optimized'))`. `datetime`, `start_datetime`, `end_datetime`, `created`, `updated`,
  * `published` and `expires` are instants (RFC 3339 strings), so `T_INTERSECTS(datetime, INTERVAL(...))` works; as
  * CQL2 requires, an instant is not compared with a date (`DATE(...)`, an interval of dates): use timestamps.
  * CQL2's three-valued logic applies: a comparison on a missing property is unknown, and an unknown item does not
@@ -248,23 +248,26 @@ export function evaluateCql2(e: Cql2Json, item: StacItemJson): boolean {
     return cql2Predicate(e)(item);
 }
 
-/** The derived property holding an item's data asset formats, see {@link cql2Predicate}. */
-export const ASSET_FORMATS = "asset_formats";
+/** The derived property holding the media types of an item's data assets, see {@link cql2Predicate}. */
+export const ASSET_MEDIA_TYPES = "asset_media_types";
 
 /**
- * The CQL2 filter that keeps items with a data asset in one of these formats: `A_OVERLAPS(asset_formats, (...))`,
- * evaluated on the client with {@link cql2Predicate} (servers do not know `asset_formats`).
+ * The CQL2 filter that keeps items with a data asset of one of these media types:
+ * `A_OVERLAPS(asset_media_types, (...))`, evaluated on the client with {@link cql2Predicate} (servers do not know
+ * `asset_media_types`). The media types are compared canonically spelled ({@link normaliseMediaType}) and otherwise
+ * exactly: `image/tiff; application=geotiff` does not match a COG, whose media type also has
+ * `profile=cloud-optimized`. List every media type wanted.
  *
- * @param formats Formats as {@link assetFormat} names them, e.g. `["COG"]` or `["COG", "GeoTIFF"]`.
+ * @param mediaTypes Media types, as STAC assets declare them in `type`.
  * @returns The CQL2-JSON filter.
  * @example
  * ```ts
- * const cogOnly = cql2Predicate(formatsFilter(["COG"]));
- * const openable = items.filter(cogOnly);
+ * const cogOnly = cql2Predicate(mediaTypesFilter(["image/tiff; application=geotiff; profile=cloud-optimized"]));
+ * const cogs = items.filter(cogOnly);
  * ```
  *
  * @category Search
  */
-export function formatsFilter(formats: readonly string[]): Cql2Json {
-    return {op: "a_overlaps", args: [{property: ASSET_FORMATS}, [...formats]]};
+export function mediaTypesFilter(mediaTypes: readonly string[]): Cql2Json {
+    return {op: "a_overlaps", args: [{property: ASSET_MEDIA_TYPES}, [...new Set(mediaTypes.map(normaliseMediaType))]]};
 }

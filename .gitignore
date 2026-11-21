@@ -10,3 +10,5 @@ build/
 CLAUDE.md
 CLAUDE.local.md
 spikes/*.log
+demo/public/license.txt
+demo/dist/

@@ -3,7 +3,7 @@
  * searches. Everything it returns is plain JSON; what it learns about the server is kept in a profile that can be
  * saved and restored.
  */
-import {assetBands, isDataAsset, type BandDescriptor} from "./bands.js";
+import {assetBands, assetMediaType, isDataAsset, normaliseMediaType, type BandDescriptor} from "./bands.js";
 import {emptyProfile, parseCapabilities, type ServerProfile, type StacCapabilities} from "./capabilities.js";
 import type {Bbox, StacCatalogJson, StacCollectionJson, StacItemCollectionJson, StacItemJson, StacLink} from "./json.js";
 import {accessFetch, originOf, type AccessHook, type HttpRequestHeaders, type HttpRequestParameters, type RiaStacRequestListener} from "./http.js";
@@ -13,8 +13,9 @@ import {bboxesIntersect, bboxOf, isGlobalBbox} from "./geometry.js";
 import {itemFootprints} from "./select.js";
 import type {Bbox as AreaBbox, GeoJsonArea} from "./json.js";
 import {absolutize, linkHref} from "./links.js";
+import {stableAssetKey} from "./naming.js";
 import {collectionItemsPlan, crawlCollections, crawlItems, staticPlan} from "./static.js";
-import {checkSelection, selectItems, summarise, type CollectionDetails, type CollectionSummary, type Pick,
+import {checkSelection, mediaTypeMatch, selectItems, summarise, type CollectionDetails, type CollectionSummary, type Pick,
     type StacSelection, type StacSelectionResult} from "./catalog.js";
 import {RiaStacError, type RiaStacProblem} from "./errors.js";
 
@@ -139,6 +140,88 @@ export interface StacClientOptions {
     };
 }
 
+/** The dates of the items a search would find, see {@link StacClient.dateRange}.
+ *
+ * @category Client */
+export interface DateRange {
+    /** The first date (RFC 3339), or null when unknown (an open start) or no item matches. */
+    first: string | null;
+    /** The last date (RFC 3339), or null when unknown (an open end: ongoing) or no item matches. */
+    last: string | null;
+    /** `"items"`: from the items themselves (the server sorts); `"declared"`: the collections' declared periods. */
+    source: "items" | "declared";
+    /** With `"declared"`: a collection declares no end (ongoing). */
+    openEnd?: boolean;
+    /** With `"items"`: no item matches the request. */
+    empty?: boolean;
+}
+
+/**
+ * The time span of a source's data, see {@link StacClient.timeExtent}: the limits a period picker can offer.
+ *
+ * @category Client */
+export interface TimeExtent {
+    /** The earliest time known (RFC 3339), or null when nothing is known about the start. */
+    min: string | null;
+    /** The latest time known (RFC 3339), or null when nothing is known about the end. */
+    max: string | null;
+    /**
+     * Where `min` comes from: `"items"` (the oldest item, from a sorted search), `"declared"` (the collections'
+     * `extent.temporal`), `"seen"` (the oldest item this client has read, earlier than what is declared), or null.
+     */
+    minSource: "items" | "declared" | "seen" | null;
+    /** Where `max` comes from, as `minSource`. */
+    maxSource: "items" | "declared" | "seen" | null;
+    /** A collection declares no start: data may begin before `min`. */
+    openStart: boolean;
+    /** A collection declares no end (ongoing): data may follow `max`. */
+    openEnd: boolean;
+    /** How many items read by this client the extent saw (see {@link StacClient.seenTimeExtent}). */
+    seen: number;
+}
+
+/** The earliest and latest times of the items a client has read, see {@link StacClient.seenTimeExtent}.
+ *
+ * @category Client */
+export interface SeenTimes {
+    /** The earliest time (RFC 3339), or null when no item had a time. */
+    min: string | null;
+    /** The latest time (RFC 3339), or null when no item had a time. */
+    max: string | null;
+    /** How many items were read (items read twice count twice). */
+    items: number;
+}
+
+/** The media types of a collection's data assets, see {@link StacClient.collectionMediaTypes}.
+ *
+ * @category Client */
+export interface CollectionMediaTypes {
+    /**
+     * Each media type, canonically spelled (see `normaliseMediaType`), with the asset keys that have it (keys of
+     * items without the item id, see `stableAssetKey`). Their number says how much of the collection has that
+     * media type.
+     */
+    mediaTypes: {
+        /** The media type (`"image/tiff; application=geotiff; profile=cloud-optimized"`, `"image/jp2"`, ...). */
+        mediaType: string;
+        /** The asset keys with this media type. */
+        keys: string[];
+        /** Whether it was inferred from file extensions for every one of these assets, because they declare no `type`. */
+        inferred: boolean;
+    }[];
+    /** Keys of data assets whose media type is not known: no `type`, and a file extension that does not tell. */
+    untyped: string[];
+    /**
+     * Where they were read: the collection's `item_assets` (complete), some of its items (may be incomplete: read
+     * more with `sampleItems`), or nowhere (no items).
+     */
+    source: "item_assets" | "sample-item" | "none";
+    /** How many items were read (0 with `item_assets`). */
+    items: number;
+    /** The id of the first item read, with `source` `"sample-item"`. */
+    sampleItem?: string;
+}
+
 /** A collection in a form ready for display and for planning searches; see {@link StacClient.describeCollection}.
  *
  * @category Client */
@@ -161,10 +244,15 @@ export interface CollectionDescription {
     interval: [string | null, string | null];
     /** The collection's summaries (empty object when it has none). */
     summaries: Record<string, unknown>;
-    /** Data assets declared in item_assets, with their bands. Empty when the collection has no item_assets. */
+    /**
+     * Data assets declared in item_assets, of any media type (not thumbnails, overviews or metadata), with their media type
+     * and bands. Empty when the collection has no item_assets.
+     */
     assets: {
         /** Asset key, as in each item's `assets`. */
         key: string;
+        /** Media type, canonically spelled (see `normaliseMediaType`); `null` when `type` is not declared. */
+        mediaType: string | null;
         /** Human-readable title. */
         title?: string;
         /** Asset roles (empty when none are declared). */
@@ -323,8 +411,27 @@ export interface CollectionFilter {
      * time (`"2024-12-31"`) as the end means the end of that day.
      */
     datetime?: [string | null, string | null];
+    /**
+     * Periods to leave out, in the form of `datetime`: a collection whose whole declared period lies inside one of
+     * them is dropped. Tested here only (Collection Search has no way to send them).
+     */
+    exceptDatetime?: [string | null, string | null][];
     /** Text to look for in the id, title, description and keywords (case-insensitive substring). */
     q?: string;
+    /**
+     * Media types (STAC asset `type`) the collection's data assets should have one of, for example
+     * `["image/tiff; application=geotiff; profile=cloud-optimized"]`; compared canonically spelled (see
+     * `normaliseMediaType`) and otherwise exactly. Tested here only, on the collections' `item_assets` (no server
+     * filters on them, and no item is read): a collection whose `item_assets` have none of them is dropped (see
+     * `mediaTypeMatch`); one without `item_assets` cannot be judged without reading items, and `mediaTypesUnsure`
+     * decides. To judge such collections, read some of their items with {@link StacClient.collectionMediaTypes}.
+     */
+    mediaTypes?: string[];
+    /**
+     * What `mediaTypes` does with collections it cannot judge (no `item_assets`): `"keep"` (the default) keeps them,
+     * since a filter should only remove what is known not to match; `"drop"` keeps only the collections known to match.
+     */
+    mediaTypesUnsure?: "keep" | "drop";
     /**
      * Drop collections whose extent is the whole world (see {@link isGlobalBbox}): what remains is regional data.
      * Collections that declare no extent are kept. Default false.
@@ -399,6 +506,8 @@ export class StacClient {
     private readonly _listeners = new Set<(p: ServerProfile) => void>();
     private _collections?: Promise<StacCollectionJson[]>;
     private readonly _details = new Map<string, CollectionDetails>();
+    /** Times of the items read, per collection id ("" for items without one). */
+    private readonly _seen = new Map<string, { min: number; max: number; items: number }>();
     /** Queryables schemas per collection, as served (null: none), for splitting filters; see queryablesSchema. */
     private readonly _queryableSchemas = new Map<string, QueryablesSchema | null>();
     private _static?: Promise<{ collections: StacCollectionJson[]; urls: Map<string, string> }>;
@@ -561,6 +670,94 @@ export class StacClient {
         return () => this._listeners.delete(listener);
     }
 
+    /** @internal Records the times of items read, for {@link StacClient.seenTimeExtent}. */
+    noteItems(items: readonly StacItemJson[]): void {
+        for (const item of items) {
+            const p = item.properties ?? {};
+            const s = Date.parse(String(p.start_datetime ?? p.datetime ?? "")), e = Date.parse(String(p.end_datetime ?? p.datetime ?? ""));
+            const key = item.collection ?? "";
+            const entry = this._seen.get(key) ?? {min: Infinity, max: -Infinity, items: 0};
+            entry.items++;
+            if (!Number.isNaN(s)) entry.min = Math.min(entry.min, s);
+            if (!Number.isNaN(e) || !Number.isNaN(s)) entry.max = Math.max(entry.max, Number.isNaN(e) ? s : e);
+            this._seen.set(key, entry);
+        }
+    }
+
+    /**
+     * The earliest and latest times of the items this client has read so far, by any search (pages, crawls of a
+     * static catalog, {@link StacClient.dateRange}): for a collection, several, or all. It grows as searches read
+     * items, costs no request, and is kept by {@link StacClient.reloadCollections}.
+     *
+     * An item counts by its `start_datetime` and `end_datetime`, else its `datetime`.
+     *
+     * @param collections The collection ids, or none for every item read.
+     * @returns The times as RFC 3339 strings, and how many items were read.
+     * @example
+     * ```ts
+     * await client.search({collections: [id], area}).collect(500);
+     * client.seenTimeExtent([id]);   // {min: "2017-12-08T...", max: "2026-11-16T...", items: 500}
+     * ```
+     */
+    seenTimeExtent(collections?: string[]): SeenTimes {
+        let min = Infinity, max = -Infinity, items = 0;
+        for (const [key, e] of this._seen) {
+            if (collections?.length && !collections.includes(key)) continue;
+            min = Math.min(min, e.min); max = Math.max(max, e.max); items += e.items;
+        }
+        const iso = (t: number) => (Number.isFinite(t) ? new Date(t).toISOString() : null);
+        return {min: iso(min), max: iso(max), items};
+    }
+
+    /**
+     * The time span of collections' data: the limits to offer in a period picker.
+     *
+     * - The declared periods of the collections (`extent.temporal`; their union for several, or for every listed
+     *   collection when none is given).
+     * - Widened by the items this client has read ({@link StacClient.seenTimeExtent}) where they go beyond: declared
+     *   periods are often rounded or stale.
+     * - With `exact`, the first and last items of a sorted search replace both ({@link StacClient.dateRange}, two
+     *   requests), where the server sorts and a collection is given.
+     *
+     * An end no collection declares (null) is reported in `openStart` / `openEnd`; `min` / `max` are then the
+     * items read, or null.
+     *
+     * @param collections Collection ids; none for every collection listed.
+     * @param options `exact` asks the server for the first and last items; `signal` aborts those requests.
+     * @returns The extent; nothing is thrown for a collection that cannot be read (it is left out).
+     * @example
+     * ```ts
+     * const extent = await client.timeExtent([id], {exact: true});
+     * // {min: "2015-06-27T10:25:31Z", max: "2026-11-19T11:02:41Z", minSource: "items", maxSource: "items", ...}
+     * ```
+     */
+    async timeExtent(collections?: string[], options: { exact?: boolean; area?: Bbox | GeoJsonArea; signal?: AbortSignal } = {}): Promise<TimeExtent> {
+        // The listed documents first (no request each); a collection not listed is read on its own.
+        const listed = await this.listCollections().catch(() => [] as StacCollectionJson[]);
+        const ids = collections?.length ? collections : listed.map((c) => c.id);
+        const intervals = (await Promise.all(ids.map((id) => {
+            const doc = listed.find((c) => c.id === id);
+            return doc ? describe(doc).interval : this.describeCollection(id).then((d) => d.interval, () => null);
+        }))).filter((i): i is [string | null, string | null] => !!i);
+        const starts = intervals.map((i) => i[0]), ends = intervals.map((i) => i[1]);
+        const openStart = !intervals.length || starts.includes(null), openEnd = !intervals.length || ends.includes(null);
+        const seen = this.seenTimeExtent(collections?.length ? collections : undefined);
+        const t = (v: string | null) => (v ? Date.parse(v) : NaN);
+        let min: string | null = openStart ? null : starts.reduce((a, b) => (t(a) <= t(b) ? a : b));
+        let max: string | null = openEnd ? null : ends.reduce((a, b) => (t(a) >= t(b) ? a : b));
+        let minSource: TimeExtent["minSource"] = min ? "declared" : null, maxSource: TimeExtent["maxSource"] = max ? "declared" : null;
+        if (seen.min && (min === null || t(seen.min) < t(min))) { min = seen.min; minSource = "seen"; }
+        if (seen.max && (max === null || t(seen.max) > t(max))) { max = seen.max; maxSource = "seen"; }
+        if (options.exact && collections?.length && this.capabilities.sort && !this.capabilities.staticCatalog) {
+            const range = await this.dateRange({collections, ...(options.area ? {area: options.area} : {})}, {signal: options.signal}).catch(() => undefined);
+            if (range?.source === "items" && !range.empty) {
+                if (range.first) { min = range.first; minSource = "items"; }
+                if (range.last) { max = range.last; maxSource = "items"; }
+            }
+        }
+        return {min, max, minSource, maxSource, openStart, openEnd, seen: seen.items};
+    }
+
     /** @internal */
     learn(update: Partial<ServerProfile>): void {
         const before = JSON.stringify(this._profile);
@@ -606,6 +803,29 @@ export class StacClient {
         const pending = this._collections;
         pending.catch(() => { if (this._collections === pending) this._collections = undefined; });
         return pending;
+    }
+
+    /**
+     * Forgets the collections read so far, so the next listing or description reads them again from the server:
+     * the full list, the server's collection searches, collection documents, their details and media types, and (for a
+     * static catalog) the crawl. Use it to see collections the server added or changed since; the client otherwise
+     * keeps them for as long as it lives, so that going back to a filter costs no request. Searches and the server
+     * profile are not affected.
+     *
+     * @example
+     * ```ts
+     * client.reloadCollections();
+     * const fresh = await client.collections({area});
+     * ```
+     */
+    reloadCollections(): void {
+        this._collections = undefined;
+        this._searched.clear();
+        this._collectionDocs.clear();
+        this._details.clear();
+        this._mediaTypes.clear();
+        this._queryableSchemas.clear();
+        this._static = undefined;
     }
 
     /** The collections endpoint: the landing page's `data` link, else `{url}/collections`. */
@@ -692,7 +912,8 @@ export class StacClient {
      *
      * Collections without a spatial or temporal extent pass the corresponding test. Boxes whose west edge is greater
      * than their east edge cross the antimeridian, for the filter and for the collections' extents alike. `q`
-     * matches case-insensitively as a substring of the id, title, description or a keyword.
+     * matches case-insensitively as a substring of the id, title, description or a keyword. `mediaTypes` is tested
+     * on `item_assets` only and keeps the collections it cannot judge, unless `mediaTypesUnsure` is `"drop"`.
      *
      * @param filter What to keep; every part is optional and an empty filter returns all collections.
      * @returns A promise of the matching collections JSON.
@@ -713,13 +934,19 @@ export class StacClient {
         const all = await this.serverCollections(filter) ?? await this.listCollections();
         const [t0, t1] = intervalMs(filter.datetime);
         const q = filter.q?.trim().toLowerCase();
+        const wantedTypes = (filter.mediaTypes ?? []).map(normaliseMediaType);
         return all.filter((c) => {
             const d = describe(c);
             if (filter.bbox && d.bbox && !bboxesIntersect(filter.bbox, d.bbox)) return false;
             if (filter.regional && d.bbox && isGlobalBbox(d.bbox)) return false;
             const i0 = d.interval[0] ? Date.parse(d.interval[0]) : -Infinity, i1 = d.interval[1] ? Date.parse(d.interval[1]) : Infinity;
             if (i0 > t1 || i1 < t0) return false;
+            if (filter.exceptDatetime?.some((p) => { const [e0, e1] = intervalMs(p); return e0 <= i0 && i1 <= e1; })) return false;
             if (q && ![c.id, c.title, c.description, ...(c.keywords ?? [])].some((t) => t?.toLowerCase().includes(q))) return false;
+            if (wantedTypes.length) {
+                const verdict = mediaTypeMatch(summarise(d), wantedTypes);
+                if (verdict === "no-match" || (verdict !== "match" && filter.mediaTypesUnsure === "drop")) return false;
+            }
             return true;
         });
     }
@@ -1049,6 +1276,49 @@ export class StacClient {
     }
 
     /**
+     * The first and last dates of the items a search would find: the true range for an area and filters, not the
+     * period a collection declares (often rounded, stale or open-ended).
+     *
+     * Two one-item searches sorted by date (oldest first, newest first), with the request's area, filters and
+     * collections and without its `datetime`. Only where the server sorts (`capabilities.sort`); otherwise the
+     * declared periods of the request's collections are returned, marked `"declared"`. An item without `datetime`
+     * counts by its `start_datetime` (first) and `end_datetime` (last).
+     *
+     * @param request The search request (its `datetime`, `limit`, `maxItems` and `sortby` are ignored).
+     * @param options `signal` aborts the requests.
+     * @returns The range, as RFC 3339 strings (null when unknown or no item matches), and where it comes from.
+     * @example
+     * ```ts
+     * const range = await client.dateRange({collections: ["sentinel-2-c1-l2a"], area});
+     * // {first: "2015-07-04T13:13:21Z", last: "2026-11-19T13:17:37Z", source: "items"}
+     * ```
+     */
+    async dateRange(request: StacSearchRequest, options: { signal?: AbortSignal } = {}): Promise<DateRange> {
+        const declared = async (): Promise<DateRange> => {
+            const intervals = await Promise.all((request.collections ?? []).map((id) => this.describeCollection(id).then((d) => d.interval, () => null)));
+            const known = intervals.filter((i): i is [string | null, string | null] => !!i);
+            if (!known.length) return {first: null, last: null, source: "declared"};
+            const starts = known.map((i) => i[0]), ends = known.map((i) => i[1]);
+            const first = starts.includes(null) ? null : starts.reduce((a, b) => (a! < b! ? a : b));
+            const last = ends.includes(null) ? null : ends.reduce((a, b) => (a! > b! ? a : b));
+            return {first, last, source: "declared", ...(ends.includes(null) ? {openEnd: true} : {})};
+        };
+        if (!this.capabilities.sort || this.capabilities.staticCatalog) return declared();
+        const {datetime: _d, exceptDatetime: _x, limit: _l, maxItems: _m, sortby: _s, ...rest} = request;
+        const one = async (direction: "asc" | "desc") => {
+            const [item] = await this.search({...rest, sortby: [{field: "datetime", direction}], limit: 1, maxItems: 1}, {signal: options.signal}).collect(1);
+            if (!item) return undefined;
+            const p = item.properties;
+            return String((direction === "asc" ? p.datetime ?? p.start_datetime : p.datetime ?? p.end_datetime) ?? "") || null;
+        };
+        const [first, last] = await Promise.all([one("asc"), one("desc")]);
+        // A server whose sort did not apply (it returned some item, not the extreme one) cannot be told apart here;
+        // the result is still a range of real items.
+        if (first === undefined && last === undefined) return {first: null, last: null, source: "items", empty: true};
+        return {first: first ?? null, last: last ?? null, source: "items"};
+    }
+
+    /**
      * Starts a search. Nothing is requested until pages, items, `collect` or `matched` is used on the result.
      *
      * Pages follow the server's `next` links. Unless `verify` is `"never"`, the first page is checked against the
@@ -1138,6 +1408,72 @@ export class StacClient {
         }));
     }
 
+    /** Media types per collection, read once each. */
+    private readonly _mediaTypes = new Map<string, Promise<CollectionMediaTypes>>();
+
+    /**
+     * The media types (STAC asset `type`) of a collection's data assets, for the user to choose from (then pass them
+     * as {@link StacSelection.mediaTypes} or to `mediaTypesFilter`). No media type is preferred.
+     *
+     * From the collection's `item_assets` when it declares them (no request beyond the collection); else from its
+     * items: one by default ({@link StacClient.sampleItem}), or the first `sampleItems` of a search, merged, since
+     * some catalogs vary their assets from item to item. Many catalogs declare no `item_assets`. Data assets only
+     * (not thumbnails, overviews or metadata), with their media types canonically spelled (see `normaliseMediaType`),
+     * inferred from the file extension for assets without `type` (see `assetMediaType`), and the asset keys of
+     * each. Read once per collection and sample size and cached; a failure is not cached. A sample shows which media
+     * types exist, not which do not: see `mediaTypeMatch`.
+     *
+     * @param collection The collection id.
+     * @param options `sampleItems`: how many items to read when the collection declares no `item_assets`
+     *   (default 1, at most 100).
+     * @returns A promise of the media types, with the asset keys that have each, and where they were read.
+     * @example
+     * ```ts
+     * const {mediaTypes} = await client.collectionMediaTypes("ch.swisstopo.swissalti3d");
+     * // [{mediaType: "image/tiff; application=geotiff; profile=cloud-optimized", keys: ["…_0.5_2056_5728.tif", …]},
+     * //  {mediaType: "application/x.ascii-xyz+zip", keys: […]}]
+     * const found = await client.select({collection: "ch.swisstopo.swissalti3d", mediaTypes: [mediaTypes[0].mediaType], area});
+     * ```
+     */
+    collectionMediaTypes(collection: string, options: { sampleItems?: number } = {}): Promise<CollectionMediaTypes> {
+        const samples = Math.max(1, Math.min(100, Math.floor(options.sampleItems ?? 1)));
+        const cacheKey = `${collection}\n${samples}`;
+        let pending = this._mediaTypes.get(cacheKey);
+        if (!pending) {
+            pending = (async (): Promise<CollectionMediaTypes> => {
+                const described = await this.describeCollection(collection);
+                type Entry = { key: string; mediaType: string | null; inferred: boolean };
+                const group = (entries: Entry[]) => {
+                    const by = new Map<string, { keys: string[]; inferred: boolean }>();
+                    for (const e of entries) {
+                        if (e.mediaType === null) continue;
+                        const g = by.get(e.mediaType) ?? {keys: [], inferred: true};
+                        if (!g.keys.includes(e.key)) g.keys.push(e.key);
+                        g.inferred &&= e.inferred;
+                        by.set(e.mediaType, g);
+                    }
+                    return {mediaTypes: [...by].map(([mediaType, g]) => ({mediaType, keys: g.keys, inferred: g.inferred})),
+                        untyped: [...new Set(entries.filter((e) => e.mediaType === null).map((e) => e.key))]};
+                };
+                if (described.assets.length) {
+                    return {...group(described.assets.map((a) => ({key: a.key, mediaType: a.mediaType, inferred: false}))), source: "item_assets", items: 0};
+                }
+                const items = samples === 1
+                    ? [await this.sampleItem(collection)].filter((i): i is StacItemJson => !!i)
+                    : await this.search({collections: [collection], limit: samples, maxItems: samples}).collect(samples);
+                if (!items.length) return {mediaTypes: [], untyped: [], source: "none", items: 0};
+                // Keys are counted once per media type: per-tile keys (swisstopo) would otherwise count every tile.
+                const entries = items.flatMap((item) => Object.entries(item.assets).filter(([k, a]) => isDataAsset(k, a))
+                    .map(([k, a]): Entry => ({key: stableAssetKey(k, item.id), ...assetMediaType(a)})));
+                return {...group(entries), source: "sample-item", items: items.length, sampleItem: items[0].id};
+            })();
+            this._mediaTypes.set(cacheKey, pending);
+            const p = pending;
+            p.catch(() => { if (this._mediaTypes.get(cacheKey) === p) this._mediaTypes.delete(cacheKey); });
+        }
+        return pending;
+    }
+
     /** The items endpoint of a collection: its `items` link, else `{collections endpoint}/{id}/items`. */
     private async itemsUrl(collection: string): Promise<string> {
         const href = await this.collectionLink(collection, "items");
@@ -1145,8 +1481,8 @@ export class StacClient {
     }
 
     /**
-     * One item of a collection, cheaply: for showing what its items hold (their assets and formats, see
-     * {@link assetFormat}) when the collection declares no `item_assets`.
+     * One item of a collection, cheaply: for showing what its items hold (their assets and media types, see
+     * `assetMediaType`) when the collection declares no `item_assets`.
      *
      * An API is asked `{url}/collections/{collection}/items?limit=1`: the items endpoint, not a search, which some
      * servers answer much faster. A static catalog gives the first item its crawl finds for the collection.
@@ -1158,7 +1494,8 @@ export class StacClient {
      * @example
      * ```ts
      * const item = await client.sampleItem("ch.swisstopo.swissimage-dop10");
-     * const formats = Object.values(item?.assets ?? {}).map((a) => assetFormat(a).format);   // ["COG"]
+     * const types = Object.values(item?.assets ?? {}).map((a) => assetMediaType(a).mediaType);
+     * // ["image/tiff; application=geotiff; profile=cloud-optimized"]
      * ```
      */
     async sampleItem(collection: string): Promise<StacItemJson | null> {
@@ -1178,7 +1515,7 @@ export class StacClient {
     // ------------------------------------------------------------------------------------------- HTTP
 
     /** @internal GET or POST with retries; throws StacError with status and body. */
-    async send(spec: HttpRequestSpec, signal?: AbortSignal, attempts?: number, timeoutMs?: number): Promise<{ status: number; json: unknown }> {
+    async send(spec: HttpRequestSpec, signal?: AbortSignal, attempts?: number, timeoutMs?: number, networkAttempts?: number): Promise<{ status: number; json: unknown }> {
         const f = this._options.fetch ?? fetch;
         const retry = {attempts: 3, statuses: [429, 502, 503, 504], backoffMs: 1000, ...this._options.retry};
         if (attempts !== undefined) retry.attempts = attempts;
@@ -1196,7 +1533,8 @@ export class StacClient {
                 }, f, {onRequest: this._options.onRequest, kind: "stac-api", url: spec.url});
             } catch (e) {
                 if (signal?.aborted) throw signal.reason;
-                if (attempt + 1 >= retry.attempts) throw new StacError(`Request failed: ${(e as Error).message}`, undefined, spec.url);
+                // Failures without a status (network, CORS) may get fewer attempts than HTTP errors (networkAttempts).
+                if (attempt + 1 >= (networkAttempts ?? retry.attempts)) throw new StacError(`Request failed: ${(e as Error).message}`, undefined, spec.url);
                 await sleep(retry.backoffMs * 2 ** attempt++);
                 if (signal?.aborted) throw signal.reason;
                 continue;
@@ -1279,7 +1617,7 @@ export function describe(c: StacCollectionJson): CollectionDescription {
     const bboxes = (c.extent?.spatial?.bbox ?? []).map((b) => (b.length >= 6 ? [b[0], b[1], b[3], b[4]] : b.slice(0, 4)) as Bbox);
     const interval = (c.extent?.temporal?.interval?.[0] ?? [null, null]) as [string | null, string | null];
     const assets = Object.entries(c.item_assets ?? {}).filter(([k, a]) => isDataAsset(k, a))
-        .map(([key, a]) => ({key, title: a.title as string | undefined, roles: (a.roles as string[] | undefined) ?? [],
+        .map(([key, a]) => ({key, mediaType: assetMediaType(a).mediaType, title: a.title as string | undefined, roles: (a.roles as string[] | undefined) ?? [],
             type: a.type as string | undefined, bands: assetBands(a)}));
     const commonNames: Record<string, string> = {};
     for (const a of assets) for (const b of a.bands) if (b.commonName && !commonNames[b.commonName]) commonNames[b.commonName] = a.key;
@@ -1384,7 +1722,7 @@ export class StacSearch {
     }
 
     /** Counts the requirement an item left out on the client fails first. */
-    private reject(item: StacItemJson, parts: { area?: boolean; datetime?: boolean; predicates?: boolean }): void {
+    private reject(item: StacItemJson, parts: { area?: boolean; datetime?: boolean; predicates?: boolean; except?: boolean }): void {
         const key = firstFailing(item, this.request, parts);
         if (key) this._rejected[key] = (this._rejected[key] ?? 0) + 1;
     }
@@ -1445,7 +1783,11 @@ export class StacSearch {
                     response = this._firstResponse.response;
                 } else {
                     // Relative next links and asset hrefs resolve against the URL of the page that carried them.
-                    response = absolutize((await this.client.send(next, this.signal)).json as StacItemCollectionJson, next.url, false);
+                    // A large first page is tried once: failing without a status, it is usually too big for the server's
+                    // gateway, and a smaller page (see recover) is quicker than retrying the same size.
+                    const pageLimit = Number(next.body?.limit ?? new URL(next.url).searchParams.get("limit"));
+                    const networkAttempts = index === 0 && pageLimit > 100 ? 1 : undefined;
+                    response = absolutize((await this.client.send(next, this.signal, undefined, undefined, networkAttempts)).json as StacItemCollectionJson, next.url, false);
                     if (index === 0 && !this.cursor) this._firstResponse = {spec, response};
                 }
             } catch (e) {
@@ -1463,7 +1805,8 @@ export class StacSearch {
                 if (encoding === "cql2-json" || encoding === "cql2-text" || encoding === "query") {
                     // CQL2: only the part sent is checked (a split leaves the rest to the client); Query: all of `where`.
                     const sent = encoding === "query" ? this.request : this.withFilter(this._plan.serverFilter);
-                    const violating = features.filter((f) => !safeMatches(f, sent, {area: false, datetime: false}));
+                    // Excluded periods are not checked: the server form is exact for instants only, and the Query extension has none.
+                    const violating = features.filter((f) => !safeMatches(f, sent, {area: false, datetime: false, except: false}));
                     const key = encoding === "query" ? "queryApplied" : "filterApplied";
                     if (violating.length) {
                         this.client.learn({[key]: "ignored"});
@@ -1477,12 +1820,14 @@ export class StacSearch {
                 verify = false;
             }
             scanned += features.length;
+            this.client.noteItems(features);
             const clientArea = this._plan.clientApplies.includes("polygon");
             const clientPredicates = this._plan.clientApplies.includes("where/filter");
-            const parts = {area: clientArea, datetime: false, predicates: clientPredicates};
+            const clientExcept = this._plan.clientApplies.includes("exceptDatetime");
+            const parts = {area: clientArea, datetime: false, predicates: clientPredicates, except: clientExcept};
             // The client tests only what the server does not apply: the client part of a split filter.
             const tested = this._plan.serverFilter !== undefined || this._plan.clientFilter !== undefined ? this.withFilter(this._plan.clientFilter) : this.request;
-            const items = clientArea || clientPredicates || this._plan.clientApplies.includes("ids")
+            const items = clientArea || clientPredicates || clientExcept || this._plan.clientApplies.includes("ids")
                 ? features.filter((f) => safeMatches(f, tested, parts) || (this.reject(f, parts), false))
                 : features;
             const room = maxItems - kept;
@@ -1567,6 +1912,7 @@ export class StacSearch {
         for await (const read of crawlItems(this.client, roots, {batch, maxScanned, signal: this.signal, area, stats})) {
             if (this.signal?.aborted) throw this.signal.reason;
             scanned += read.length;
+            this.client.noteItems(read);
             const pageItems = read.filter((i) => safeMatches(i, this.request, {}) || (this.reject(i, {}), false)).slice(0, maxItems - kept);
             kept += pageItems.length;
             this.onProgress?.({step: "search", pages: index + 1, scanned, kept, ...(stats.pruned ? {pruned: stats.pruned} : {})});
@@ -1577,6 +1923,16 @@ export class StacSearch {
 
     /** Recovers from errors that have a known cure; returns the request to retry, or undefined. */
     private recover(error: StacError, spec: HttpRequestSpec, firstPage: boolean): HttpRequestSpec | undefined {
+        const limit = Number(spec.body?.limit ?? new URL(spec.url).searchParams.get("limit"));
+        // A first page that fails without an HTTP status is either a refused CORS preflight (POST not allowed) or a
+        // response too large for the server's gateway, which then answers 502 without CORS headers: what the browser
+        // shows as a network error (Earth Search with 500 Sentinel-2 items). A smaller page first, then GET.
+        if (firstPage && error.status === undefined && limit > 100) {
+            const smaller = Math.max(100, Math.floor(limit / 2));
+            this.client.learn({maxLimit: smaller});
+            this.replan({...this.request, limit: smaller});
+            return this._plan.http;
+        }
         // POST refused (405), or a first-page POST that failed without an HTTP status (a CORS preflight refused by a
         // server that only allows GET): GET from now on.
         if (spec.method === "POST" && (error.status === 405 || (firstPage && error.status === undefined))) {
@@ -1599,7 +1955,6 @@ export class StacSearch {
             return this._plan.http;
         }
         // Page size too large: 400 naming the limit, or gateway errors from oversized responses.
-        const limit = Number(spec.body?.limit ?? new URL(spec.url).searchParams.get("limit"));
         const sizeError = error.status === 413 || error.status === 502 || error.status === 504
             || (error.status === 400 && /limit/i.test(JSON.stringify(error.body ?? "")));
         if (firstPage && sizeError && limit > 10) {
@@ -1618,13 +1973,14 @@ function excludeBefore(encoding: FilterEncoding): FilterEncoding[] {
 }
 
 /** The first requirement of `request` an item fails: collections, ids, datetime, area, then each `where` property. */
-function firstFailing(item: StacItemJson, request: StacSearchRequest, parts: { area?: boolean; datetime?: boolean; predicates?: boolean }): string | undefined {
-    const {area = true, datetime = true, predicates = true} = parts;
-    const none = {area: false, datetime: false, predicates: false};
+function firstFailing(item: StacItemJson, request: StacSearchRequest, parts: { area?: boolean; datetime?: boolean; predicates?: boolean; except?: boolean }): string | undefined {
+    const {area = true, datetime = true, predicates = true, except = true} = parts;
+    const none = {area: false, datetime: false, predicates: false, except: false};
     const fails = (r: StacSearchRequest, p: typeof parts) => !safeMatches(item, r, p);
     if (request.collections?.length && fails({collections: request.collections}, none)) return "collections";
     if (request.ids?.length && fails({ids: request.ids}, none)) return "ids";
-    if (datetime && request.datetime !== undefined && fails({datetime: request.datetime}, {datetime: true, area: false, predicates: false})) return "datetime";
+    if (datetime && request.datetime !== undefined && fails({datetime: request.datetime}, {...none, datetime: true})) return "datetime";
+    if (except && request.exceptDatetime?.length && fails({exceptDatetime: request.exceptDatetime}, {...none, except: true})) return "exceptDatetime";
     if (area && request.area && fails({area: request.area}, {area: true, datetime: false, predicates: false})) return "area";
     if (predicates) {
         for (const [k, v] of Object.entries(request.where ?? {})) {
@@ -1635,7 +1991,7 @@ function firstFailing(item: StacItemJson, request: StacSearchRequest, parts: { a
     return undefined;
 }
 
-function safeMatches(item: StacItemJson, request: StacSearchRequest, parts: { area?: boolean; datetime?: boolean; predicates?: boolean }): boolean {
+function safeMatches(item: StacItemJson, request: StacSearchRequest, parts: { area?: boolean; datetime?: boolean; predicates?: boolean; except?: boolean }): boolean {
     try {
         return itemMatches(item, request, parts);
     } catch {

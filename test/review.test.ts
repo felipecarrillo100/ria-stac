@@ -4,8 +4,8 @@
  */
 import {afterAll, afterEach, beforeAll, describe, expect, it, vi} from "vitest";
 import {
-    collectionBands, cql2Predicate, describeCollectionJson, evaluateCql2, formatsFilter, itemFormats, toCql2Text, footprintOf, bboxOf, groupItems, periodOf,
-    assetFormat, elevationHint, resolveAsset, solarLongitude, StacClient, StacError, type StacCollectionJson, type StacItemJson,
+    collectionBands, cql2Predicate, describeCollectionJson, evaluateCql2, mediaTypesFilter, itemMediaTypes, normaliseMediaType, toCql2Text, footprintOf, bboxOf, groupItems, periodOf,
+    assetMediaType, elevationHint, resolveAsset, solarLongitude, StacClient, StacError, type StacCollectionJson, type StacItemJson,
 } from "../src/index.js";
 import {bboxesIntersect} from "../src/geometry.js";
 import {startRangeServer} from "./helpers.js";
@@ -121,23 +121,18 @@ describe("select: one coordinate reference", () => {
 });
 
 describe("STAC metadata", () => {
-    it("names asset formats and says which ones a model can open (assetFormat)", () => {
-        const f = (type: string | undefined, href = "https://x.test/a") => assetFormat({type, href});
-        expect(f("image/tiff; application=geotiff; profile=cloud-optimized")).toEqual({format: "COG", openable: true, cog: true});
-        expect(f("image/tiff; application=geotiff")).toEqual({format: "GeoTIFF", openable: true, cog: false});
-        expect(f(undefined, "https://x.test/dem.tif?sig=1")).toMatchObject({format: "GeoTIFF", openable: true});
-        expect(f("application/x.tiff+zip")).toEqual({format: "GeoTIFF (zipped)", openable: false, cog: false});
-        expect(f(undefined, "https://x.test/dem.tif.zip")).toMatchObject({format: "GeoTIFF (zipped)", openable: false});
-        expect(f("application/x.interlis+zip; version=2.3").format).toBe("INTERLIS (zipped)");
-        expect(f("application/x.ms-access+zip").format).toBe("MS Access (zipped)");
-        expect(f("application/zip").format).toBe("ZIP");
-        expect(f("application/geopackage+sqlite3").format).toBe("GeoPackage");
-        expect(f("text/csv").format).toBe("CSV");
-        expect(f("application/geo+json").format).toBe("GeoJSON");
-        expect(f("image/jpeg").format).toBe("JPEG");
-        expect(f("application/xml").format).toBe("XML");
-        expect(f("application/vnd.google-earth.kmz").format).toBe("KML");
-        expect(f("application/x-foo").format).toBe("FOO");
+    it("gives asset media types canonically spelled, or inferred from the file name (assetMediaType)", () => {
+        const f = (type: string | undefined, href = "https://x.test/a") => assetMediaType({type, href});
+        expect(f("image/tiff; application=geotiff; profile=cloud-optimized")).toEqual({mediaType: "image/tiff; application=geotiff; profile=cloud-optimized", inferred: false});
+        expect(f("Image/TIFF;profile=cloud-optimized;application=\"geotiff\"")).toEqual({mediaType: "image/tiff; application=geotiff; profile=cloud-optimized", inferred: false});
+        expect(f(undefined, "https://x.test/dem.tif?sig=1")).toEqual({mediaType: "image/tiff", inferred: true});
+        expect(f(undefined, "https://x.test/cloud.copc.laz")).toEqual({mediaType: "application/vnd.laszip+copc", inferred: true});
+        expect(f(undefined, "https://x.test/dem.tif.zip")).toEqual({mediaType: "application/zip", inferred: true});
+        expect(f(undefined, "https://x.test/data.zarr")).toEqual({mediaType: null, inferred: false});
+        expect(f("application/x.interlis+zip; version=2.3").mediaType).toBe("application/x.interlis+zip; version=2.3");
+        expect(f("  ").mediaType).toBe(null);
+        expect(normaliseMediaType(" Text/CSV ")).toBe("text/csv");
+        expect(normaliseMediaType("not a media type")).toBe("not a media type");
     });
 
     it("samples one item of a collection through the items endpoint, or the crawl of a static catalog", async () => {
@@ -227,19 +222,22 @@ describe("STAC helpers", () => {
         expect(() => evaluateCql2({op: "s_within", args: [{property: "geometry"}, {bbox: [0, 0, 2, 2]}]}, item)).toThrow(/unsupported|Spatial/i);
     });
 
-    it("17b. filters items by asset format with CQL2: asset_formats, formatsFilter and itemFormats", () => {
+    it("17b. filters items by asset media type with CQL2: asset_media_types, mediaTypesFilter and itemMediaTypes", () => {
+        const COG = "image/tiff; application=geotiff; profile=cloud-optimized", TIFF = "image/tiff; application=geotiff";
         const cog = boxItem("cog", [0, 0, 1, 1], "EPSG:4326");
         const zipped = {...cog, id: "zip", assets: {xyz: {href: "https://x.test/t.xyz.zip", type: "application/x.ascii-xyz+zip"},
             thumbnail: {href: "https://x.test/t.png", type: "image/png", roles: ["thumbnail"]}}};
-        const plain = {...cog, id: "tif", assets: {data: {href: "https://x.test/t.tif", type: "image/tiff; application=geotiff"}}};
-        expect(itemFormats(cog)).toEqual(["COG"]);
-        expect(itemFormats(zipped)).toEqual(["XYZ (zipped)"]);
-        const cogOnly = cql2Predicate(formatsFilter(["COG"]));
+        const plain = {...cog, id: "tif", assets: {data: {href: "https://x.test/t.tif", type: "image/tiff;application=geotiff"}}};
+        expect(itemMediaTypes(cog)).toEqual([COG]);
+        expect(itemMediaTypes(zipped)).toEqual(["application/x.ascii-xyz+zip"]);
+        expect(itemMediaTypes(plain)).toEqual([TIFF]);
+        const cogOnly = cql2Predicate(mediaTypesFilter([COG]));
         expect([cog, zipped, plain].filter(cogOnly).map((i) => i.id)).toEqual(["cog"]);
-        expect([cog, zipped, plain].filter(cql2Predicate(formatsFilter(["COG", "GeoTIFF"]))).map((i) => i.id)).toEqual(["cog", "tif"]);
-        expect(toCql2Text(formatsFilter(["COG"]))).toBe("A_OVERLAPS(asset_formats, ('COG'))");
+        // Spelling does not matter; parameters do (a plain GeoTIFF is not a COG).
+        expect([cog, zipped, plain].filter(cql2Predicate(mediaTypesFilter(["IMAGE/TIFF; profile=cloud-optimized; application=geotiff", TIFF]))).map((i) => i.id)).toEqual(["cog", "tif"]);
+        expect(toCql2Text(mediaTypesFilter([COG]))).toBe(`A_OVERLAPS(asset_media_types, ('${COG}'))`);
         // An item property of that name wins over the derived one.
-        expect(cogOnly({...zipped, properties: {...zipped.properties, asset_formats: ["COG"]}})).toBe(true);
+        expect(cogOnly({...zipped, properties: {...zipped.properties, asset_media_types: [COG]}})).toBe(true);
     });
 
     it("19. names the bands of a collection from its item_assets", () => {

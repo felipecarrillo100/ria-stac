@@ -106,97 +106,124 @@ function clean<T extends object>(o: T): T {
     return o;
 }
 
-const COG_TYPE = /image\/tiff/i;
+const TIFF_TYPE = /^image\/tiff\b/i;
 
 /**
  * Whether an asset is a (Cloud Optimized) GeoTIFF by media type, or by file extension when it has no type.
  *
  * @param asset The asset; `type` and `href` are read.
- * @returns `true` when `type` contains `image/tiff` (any profile, case-insensitive), or, without `type`, when
- *   `href` ends in `.tif` or `.tiff` (before any query string).
+ * @returns `true` when `type` is `image/tiff` (any parameters, case-insensitive), or, without `type`, when `href`
+ *   ends in `.tif` or `.tiff` (before any query string).
  *
  * @category Assets and bands
  */
 export function isGeoTiffAsset(asset: Partial<StacAssetJson>): boolean {
-    if (asset.type) return COG_TYPE.test(asset.type);
+    if (asset.type) return TIFF_TYPE.test(asset.type.trim());
     return typeof asset.href === "string" && /\.tiff?($|\?)/i.test(asset.href);
 }
 
-/** The format of a STAC asset, see {@link assetFormat}. */
-export interface AssetFormat {
-    /** Short name for display: `"COG"`, `"GeoTIFF"`, `"GeoTIFF (zipped)"`, `"INTERLIS (zipped)"`, `"CSV"`, ... */
-    format: string;
-    /** Whether a model can open it: a GeoTIFF by media type or extension ({@link isGeoTiffAsset}). */
-    openable: boolean;
-    /** Whether it declares the cloud-optimized profile (`profile=cloud-optimized`). A GeoTIFF without it may still be a COG. */
-    cog: boolean;
+/**
+ * A media type in one canonical spelling, so that equal media types compare equal as strings.
+ *
+ * Media types (RFC 6838, the values of STAC's asset `type`) are case-insensitive in their type, subtype and
+ * parameter names, and the order of their parameters and the spaces around them carry no meaning. This writes the
+ * type, subtype, parameter names and values in lower case, without quotes or extra spaces, with the parameters
+ * sorted by name: `Image/TIFF;profile=cloud-optimized; application="geotiff"` becomes
+ * `image/tiff; application=geotiff; profile=cloud-optimized`. A value that is not of the form `type/subtype` is only
+ * trimmed and written in lower case.
+ *
+ * @param mediaType A media type, as found in an asset's `type`.
+ * @returns The same media type, canonically spelled.
+ * @example
+ * ```ts
+ * normaliseMediaType("image/tiff;application=geotiff;profile=cloud-optimized");
+ * // "image/tiff; application=geotiff; profile=cloud-optimized"
+ * ```
+ *
+ * @category Assets and bands
+ */
+export function normaliseMediaType(mediaType: string): string {
+    const [essence, ...rest] = mediaType.split(";");
+    const base = essence.trim().toLowerCase().replace(/\s+/g, "");
+    if (!/^[^/]+\/[^/]+$/.test(base)) return mediaType.trim().toLowerCase();
+    const params = rest.map((p) => {
+        const at = p.indexOf("=");
+        const name = (at < 0 ? p : p.slice(0, at)).trim().toLowerCase();
+        const value = at < 0 ? "" : p.slice(at + 1).trim().replace(/^"(.*)"$/, "$1").toLowerCase();
+        return [name, value] as const;
+    }).filter(([name]) => name).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return [base, ...params.map(([n, v]) => (v ? `${n}=${v}` : n))].join("; ");
 }
 
-/** Media type or extension patterns to display names, first match wins. */
-const FORMATS: [RegExp, string][] = [
-    [/interlis|\.xtf\b/i, "INTERLIS"], [/ms-access|\.mdb\b/i, "MS Access"], [/geopackage|\.gpkg\b/i, "GeoPackage"],
-    [/shapefile|esri-shape|\.shp\b/i, "Shapefile"], [/geo\+json|\.geojson\b/i, "GeoJSON"], [/parquet|\.parquet\b/i, "GeoParquet"],
-    [/x-ndjson|\.ndjson\b/i, "NDJSON"], [/json|\.json\b/i, "JSON"], [/csv|\.csv\b/i, "CSV"], [/xml|\.xml\b/i, "XML"],
-    [/jpeg|\.jpe?g\b/i, "JPEG"], [/png|\.png\b/i, "PNG"], [/jp2|\.j2k\b|\.jp2\b/i, "JPEG 2000"], [/pdf|\.pdf\b/i, "PDF"],
-    [/ascii-xyz|\.xyz\b/i, "XYZ"], [/netcdf|x-hdf|\.nc\b|\.h5\b|\.hdf\b/i, "NetCDF/HDF"], [/zarr/i, "Zarr"], [/las|\.la[sz]\b|copc/i, "Point cloud"],
-    [/dxf|dwg|\.dxf\b|\.dwg\b/i, "CAD"], [/gltf|glb|3d-tiles|\.b3dm\b/i, "3D"], [/html|\.html?\b/i, "HTML"],
-    [/text\/plain|\.txt\b/i, "Text"], [/google-earth|\.km[lz]\b/i, "KML"], [/grib|\.grib2?\b/i, "GRIB"], [/zip|\.zip\b/i, "ZIP"],
-];
+/** The media type of a STAC asset, see {@link assetMediaType}.
+ *
+ * @category Assets and bands */
+export interface AssetMediaType {
+    /** The media type, canonically spelled ({@link normaliseMediaType}); `null` when neither `type` nor the file extension tells. */
+    mediaType: string | null;
+    /** Whether it was inferred from the file extension of `href`, because the asset declares no `type`. */
+    inferred: boolean;
+}
 
 /**
- * Names the format of a STAC asset and says whether a model can open it, for lists that show every asset and grey
- * out the ones that cannot be used (downloads in ZIP, vector formats, documents).
- *
- * The media type decides; without one, the extension of `href`. Only GeoTIFFs open: `"COG"` when the type declares
- * `profile=cloud-optimized`, else `"GeoTIFF"`. A zipped file (`application/x.tiff+zip`, `.tif.zip`) cannot be read
- * with range requests, so it is `"GeoTIFF (zipped)"` and not openable.
+ * File extensions to the media types STAC's best practices and IANA give them, for assets that declare no `type`.
+ * Only extensions with one clear media type; others (`.zarr` folders, `.xyz`) give none.
+ */
+const EXTENSION_TYPES: Record<string, string> = {
+    tif: "image/tiff", tiff: "image/tiff", jp2: "image/jp2", j2k: "image/jp2", png: "image/png", jpg: "image/jpeg",
+    jpeg: "image/jpeg", webp: "image/webp", gif: "image/gif", json: "application/json", geojson: "application/geo+json",
+    parquet: "application/vnd.apache.parquet", gpkg: "application/geopackage+sqlite3", shp: "application/vnd.shp",
+    fgb: "application/vnd.flatgeobuf", kml: "application/vnd.google-earth.kml+xml", kmz: "application/vnd.google-earth.kmz",
+    nc: "application/x-netcdf", h5: "application/x-hdf5", hdf: "application/x-hdf", grib2: "application/wmo-grib2",
+    laz: "application/vnd.laszip", las: "application/vnd.las", glb: "model/gltf-binary", gltf: "model/gltf+json",
+    xml: "application/xml", csv: "text/csv", txt: "text/plain", html: "text/html", htm: "text/html", pdf: "application/pdf",
+    zip: "application/zip", xtf: "application/interlis+xml", dxf: "image/vnd.dxf", dwg: "image/vnd.dwg",
+};
+
+/**
+ * The media type of a STAC asset: its `type`, canonically spelled ({@link normaliseMediaType}); for an asset that
+ * declares none, the media type of its file extension (`.tif` → `image/tiff`, `.copc.laz` → `application/vnd.laszip+copc`),
+ * marked `inferred`. No media type is preferred: which ones matter is the application's choice. Grouping media
+ * types into formats for people (a "COG" is `image/tiff; application=geotiff; profile=cloud-optimized`) is left to
+ * the application too, since STAC does not define one.
  *
  * @param asset The asset; `type` and `href` are read.
- * @returns Its display format, whether it opens, and whether it declares the COG profile.
- *
+ * @returns The media type and whether it was inferred; `mediaType` is `null` when neither tells.
  * @example
  * ```ts
  * for (const [key, asset] of Object.entries(item.assets)) {
- *     const {format, openable} = assetFormat(asset);
- *     console.log(`${key}: ${format}${openable ? "" : " (cannot be opened)"}`);
+ *     const {mediaType, inferred} = assetMediaType(asset);
+ *     console.log(`${key}: ${mediaType ?? "unknown"}${inferred ? " (from the file name)" : ""}`);
  * }
  * ```
  *
  * @category Assets and bands
  */
-export function assetFormat(asset: Partial<StacAssetJson>): AssetFormat {
-    const type = asset.type ?? "";
-    const path = typeof asset.href === "string" ? asset.href.replace(/[?#].*$/, "") : "";
-    const subject = type || path;
-    const zipped = /\+zip\b|zip$|\.zip$/i.test(type) || /\.zip$/i.test(path);
-    if (isGeoTiffAsset(asset) && !zipped) {
-        const cog = /profile=cloud-optimized/i.test(type);
-        return {format: cog ? "COG" : "GeoTIFF", openable: true, cog};
-    }
-    // What is zipped: the media type before +zip, else the extension before .zip.
-    const inner = zipped ? (type.replace(/\+zip.*$/i, "") || path.replace(/\.zip$/i, "")) : subject;
-    const named = /tiff?\b/i.test(inner) ? "GeoTIFF" : FORMATS.find(([pattern]) => pattern.test(inner))?.[1];
-    const format = zipped ? (named && named !== "ZIP" ? `${named} (zipped)` : "ZIP")
-        : named ?? (type ? type.split(";")[0].replace(/^[a-z]+\/(x[.-])?/i, "").toUpperCase() : path.match(/\.([a-z0-9]+)$/i)?.[1]?.toUpperCase() ?? "unknown");
-    return {format, openable: false, cog: false};
+export function assetMediaType(asset: Partial<StacAssetJson>): AssetMediaType {
+    if (typeof asset.type === "string" && asset.type.trim()) return {mediaType: normaliseMediaType(asset.type), inferred: false};
+    const path = typeof asset.href === "string" ? asset.href.replace(/[?#].*$/, "").toLowerCase() : "";
+    if (/\.copc\.laz$/.test(path)) return {mediaType: "application/vnd.laszip+copc", inferred: true};
+    const ext = path.match(/\.([a-z0-9]+)$/)?.[1];
+    const type = ext ? EXTENSION_TYPES[ext] : undefined;
+    return type ? {mediaType: type, inferred: true} : {mediaType: null, inferred: false};
 }
 
 /**
- * Assets that are imagery data (not thumbnails, overviews or metadata).
+ * Assets that hold the item's data, in any format: not thumbnails, overviews, previews or metadata.
  *
  * @param key The asset key in the item.
- * @param asset The asset; `roles`, `type` and `href` are read.
- * @returns `false` for the roles `thumbnail`, `overview` or `metadata`, for `visual` without `data`, for keys
- *   `thumbnail`, `preview`, `rendered_preview` and `tilejson`, and for assets that are not GeoTIFFs
- *   ({@link isGeoTiffAsset}); `true` otherwise.
+ * @param asset The asset; `roles` is read.
+ * @returns `false` for the roles `thumbnail`, `overview` or `metadata`, for `visual` without `data`, and for keys
+ *   `thumbnail`, `preview`, `rendered_preview` and `tilejson`; `true` otherwise, whatever the format (filter by
+ *   {@link assetMediaType} or {@link isGeoTiffAsset} for a particular one).
  *
  * @category Assets and bands
  */
 export function isDataAsset(key: string, asset: Partial<StacAssetJson>): boolean {
-    return isGeoTiffAsset(asset) && isContentAsset(key, asset);
+    return isContentAsset(key, asset);
 }
 
-/** Not a thumbnail, overview, preview or metadata asset: the rule of {@link isDataAsset} without the GeoTIFF test. */
+/** Not a thumbnail, overview, preview or metadata asset (see {@link isDataAsset}). */
 function isContentAsset(key: string, asset: Partial<StacAssetJson>): boolean {
     const roles = asset.roles ?? [];
     if (roles.some((r) => r === "thumbnail" || r === "overview" || r === "metadata")) return false;
@@ -205,23 +232,24 @@ function isContentAsset(key: string, asset: Partial<StacAssetJson>): boolean {
 }
 
 /**
- * The formats of an item's content assets, as {@link assetFormat} names them, each once: `["COG"]`,
- * `["XYZ (zipped)"]`, `["GeoTIFF", "PDF"]`. Thumbnails, overviews, previews and metadata are left out, by the rule
- * of {@link isDataAsset}. This is the `asset_formats` property CQL2 filters read on the client (see
- * `cql2Predicate` and `formatsFilter`).
+ * The media types of an item's content assets, as {@link assetMediaType} gives them (inferred ones included), each
+ * once: `["image/tiff; application=geotiff; profile=cloud-optimized"]`, `["application/zip", "application/pdf"]`.
+ * Thumbnails, overviews, previews and metadata are left out, by the rule of {@link isDataAsset}. This is the
+ * `asset_media_types` property CQL2 filters read on the client (see `cql2Predicate` and `mediaTypesFilter`).
  *
  * @param item The item; its `assets` are read.
- * @returns The formats, in the order of the assets.
+ * @returns The media types, in the order of the assets.
  * @example
  * ```ts
- * const openable = items.filter((item) => itemFormats(item).some((f) => f === "COG" || f === "GeoTIFF"));
+ * const zarr = items.filter((item) => itemMediaTypes(item).includes("application/vnd+zarr"));
  * ```
  *
  * @category Assets and bands
  */
-export function itemFormats(item: { assets?: Record<string, Partial<StacAssetJson>> }): string[] {
-    const formats = Object.entries(item.assets ?? {}).filter(([key, asset]) => isContentAsset(key, asset)).map(([, asset]) => assetFormat(asset).format);
-    return [...new Set(formats)];
+export function itemMediaTypes(item: { assets?: Record<string, Partial<StacAssetJson>> }): string[] {
+    const types = Object.entries(item.assets ?? {}).filter(([key, asset]) => isContentAsset(key, asset))
+        .map(([, asset]) => assetMediaType(asset).mediaType).filter((t): t is string => t !== null);
+    return [...new Set(types)];
 }
 
 export {bandIdentifier, nameAssetBands} from "./naming.js";

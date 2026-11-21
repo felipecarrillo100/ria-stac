@@ -45,6 +45,16 @@ export interface StacSearchRequest {
      * values, `"2018/2026"`, or `[start, end]` with `null` for an open end.
      */
     datetime?: DateLike | [DateLike | null, DateLike | null];
+    /**
+     * Periods to leave out, in the same forms as `datetime` (`"2020-03"`, `["2020-03-01", "2020-05-31"]`,
+     * `["2024-06-01", null]` for everything from that day on). An item is left out when its time (its
+     * `start_datetime`/`end_datetime`, else its `datetime`) overlaps one of them.
+     *
+     * STAC's `datetime` parameter takes one interval only, so the periods become a CQL2 filter of basic comparisons
+     * (see {@link exceptFilter}), ANDed with `where` and `filter`: sent to servers with CQL2, tested on the client
+     * elsewhere (see `SearchPlan.clientApplies`). A period open at both ends leaves out every item.
+     */
+    exceptDatetime?: (DateLike | [DateLike | null, DateLike | null])[];
     /** Portable property predicates, compiled to CQL2, the Query extension or a client-side check. */
     where?: Record<string, WhereComparison>;
     /** Raw CQL2-JSON (power users), ANDed with `where`. */
@@ -388,10 +398,92 @@ const sortField = (f: string) => (/^(id|collection|properties\.)/.test(f) ? f : 
  *
  * @category Search
  */
-export function requestFilter(request: StacSearchRequest, advanced = true): Cql2Json | undefined {
+export function requestFilter(request: StacSearchRequest, advanced = true, except = true): Cql2Json | undefined {
     const fromWhere = request.where ? whereToCql2(request.where, advanced) : undefined;
-    if (request.filter !== undefined && fromWhere) return {op: "and", args: [request.filter, fromWhere]};
-    return request.filter ?? fromWhere;
+    const parts = [request.filter, fromWhere, ...(except ? exceptConjuncts(request.exceptDatetime) : [])].filter((p): p is Cql2Json => p !== undefined);
+    return parts.length > 1 ? {op: "and", args: parts} : parts[0];
+}
+
+/** One end of a period: the instant, or null when open. */
+function periodEnds(period: NonNullable<StacSearchRequest["exceptDatetime"]>[number]): [string | null, string | null] {
+    const dt = normaliseDatetime(period)!;
+    const [a, b] = dt.includes("/") ? dt.split("/") : [dt, dt];
+    return [a === ".." ? null : a, b === ".." ? null : b];
+}
+
+/**
+ * The excluded periods as sent to a server: one conjunct per period, keeping an item when
+ * `datetime < a OR end_datetime < a OR datetime > b`. Only `datetime` and `end_datetime` are used: Planetary
+ * Computer (pgstac) answers HTTP 500 to filters on `start_datetime` or with `IS NULL`. This is exact for items with
+ * an instant; items with a span are tested exactly on the client afterwards (see {@link exceptFilter}).
+ */
+function exceptConjuncts(periods: StacSearchRequest["exceptDatetime"]): Cql2Json[] {
+    const cmp = (op: "<" | ">", name: string, t: string): Cql2Json => ({op, args: [{property: name}, {timestamp: t}]});
+    return (periods ?? []).map((period) => {
+        const [a, b] = periodEnds(period);
+        const keep = [...(a ? [cmp("<", "datetime", a), cmp("<", "end_datetime", a)] : []), ...(b ? [cmp(">", "datetime", b)] : [])];
+        // Open at both ends: nothing is kept.
+        return keep.length === 0 ? {op: "<", args: [{property: "datetime"}, {timestamp: "0001-01-01T00:00:00Z"}]} : keep.length === 1 ? keep[0] : {op: "or", args: keep};
+    });
+}
+
+/** Whether an item's time (start/end, else datetime) lies outside every excluded period. Items without a time are kept. */
+function outsidePeriods(item: StacItemJson, periods: StacSearchRequest["exceptDatetime"]): boolean {
+    if (!periods?.length) return true;
+    const p = item.properties;
+    const s = Date.parse(String(p.start_datetime ?? p.datetime ?? "")), e0 = Date.parse(String(p.end_datetime ?? p.datetime ?? ""));
+    if (Number.isNaN(s)) return true;
+    const e = Number.isNaN(e0) ? s : e0;
+    return periods.every((period) => {
+        const [a, b] = periodEnds(period);
+        return (a !== null && e < Date.parse(a)) || (b !== null && s > Date.parse(b));
+    });
+}
+
+/**
+ * The exact CQL2-JSON filter that keeps the items outside some periods (see {@link StacSearchRequest.exceptDatetime}),
+ * for evaluating items or for servers known to handle `start_datetime` and `IS NULL`. Searches send a simpler form
+ * to the server (`datetime < a OR end_datetime < a OR datetime > b`, exact for instants) and apply this rule to the
+ * items returned.
+ *
+ * Only basic CQL2 is used (comparisons, `isNull`, `and`, `or`), which every server with the Filter extension must
+ * support. For each period `[a, b]` an item is kept when it ends before `a` or starts after `b`:
+ *
+ * ```text
+ * (start_datetime IS NULL AND (datetime < a OR datetime > b)) OR end_datetime < a OR start_datetime > b
+ * ```
+ *
+ * The first part is for items with an instant, the others for items with a span (and for servers such as pgstac
+ * that give instant items a `start_datetime` and `end_datetime` equal to their `datetime`). An open end drops the
+ * comparisons with it; a period open at both ends gives `false`.
+ *
+ * @param periods The periods, in the forms of `datetime` (partial dates are whole periods).
+ * @returns One expression (an `and` of one per period), or `undefined` for no period.
+ * @example
+ * ```ts
+ * exceptFilter(["2020-03/2020-05"]);  // keeps items before March 2020 or after May 2020
+ * ```
+ *
+ * @category Search
+ */
+export function exceptFilter(periods: StacSearchRequest["exceptDatetime"]): Cql2Json | undefined {
+    if (!periods?.length) return undefined;
+    const prop = (name: string) => ({property: name});
+    const cmp = (op: "<" | ">", name: string, t: string): Cql2Json => ({op, args: [prop(name), {timestamp: t}]});
+    const anyOf = (args: Cql2Json[]): Cql2Json => (args.length === 1 ? args[0] : {op: "or", args});
+    const keeps = periods.map((period): Cql2Json => {
+        const dt = normaliseDatetime(period)!;
+        const [a, b] = dt.includes("/") ? dt.split("/") : [dt, dt];
+        const before = a !== "..", after = b !== "..";
+        if (!before && !after) return false as unknown as Cql2Json;
+        const instant = [...(before ? [cmp("<", "datetime", a)] : []), ...(after ? [cmp(">", "datetime", b)] : [])];
+        return anyOf([
+            {op: "and", args: [{op: "isNull", args: [prop("start_datetime")]}, anyOf(instant)]},
+            ...(before ? [cmp("<", "end_datetime", a)] : []),
+            ...(after ? [cmp(">", "start_datetime", b)] : []),
+        ]);
+    });
+    return keeps.length === 1 ? keeps[0] : {op: "and", args: keeps};
 }
 
 /**
@@ -453,7 +545,8 @@ export function planSearch(
 
     // Filter encoding: CQL2-JSON (POST), CQL2-text (GET), the Query extension, else client-side.
     let serverFilter: Cql2Json | undefined, planClientFilter: Cql2Json | undefined, noCql2: string | undefined;
-    const hasPredicates = request.where !== undefined || request.filter !== undefined;
+    const hasExcept = !!request.exceptDatetime?.length;
+    const hasPredicates = request.where !== undefined || request.filter !== undefined || hasExcept;
     let encoding: FilterEncoding = "none";
     if (hasPredicates || request.query) {
         const f = caps.filter;
@@ -484,10 +577,14 @@ export function planSearch(
                 body["filter-lang"] = encoding;
                 serverFilter = split.server;
                 serverApplies.push(`filter (${encoding})`);
-                if (split.client !== undefined) {
-                    planClientFilter = split.client;
+                // Excluded periods the server cannot take need no client part: the exact test runs anyway.
+                const excepts = new Set(exceptConjuncts(request.exceptDatetime).map((c) => JSON.stringify(c)));
+                const clientPart = split.client === undefined ? undefined
+                    : andOf(conjuncts(split.client).filter((c) => !excepts.has(JSON.stringify(c))));
+                if (clientPart !== undefined) {
+                    planClientFilter = clientPart;
                     clientApplies.push("where/filter");
-                    degradations.push({kind: "filter-split", client: textOf(split.client), reason: split.reason});
+                    degradations.push({kind: "filter-split", client: textOf(clientPart), reason: split.reason});
                 }
             }
         }
@@ -495,10 +592,11 @@ export function planSearch(
             body.query = {...(whereQuery ?? {}), ...(request.query ?? {})};
             serverApplies.push("query extension");
             if (hasPredicates) degradations.push({kind: "filter-via-query", reason: noCql2 ?? (f ? "CQL2 found ignored by this server" : "no CQL2 support")});
+            if (hasExcept) degradations.push({kind: "filter-split", client: "exceptDatetime", reason: "the Query extension cannot leave out a period"});
         }
         if (encoding === "client") {
-            if (hasPredicates) {
-                planClientFilter = requestFilter(request);
+            if (request.where !== undefined || request.filter !== undefined) {
+                planClientFilter = requestFilter(request, true, false);
                 if (!clientApplies.includes("where/filter")) clientApplies.push("where/filter");
                 degradations.push({kind: "filter-client-side", reason: noCql2 ?? "the server applies no usable filter", maxScanned: request.maxScanned ?? 2000});
             }
@@ -508,6 +606,9 @@ export function planSearch(
             }
         }
     }
+
+    // Excluded periods: always tested exactly on the client (the server form is exact for instants only).
+    if (request.exceptDatetime?.length) clientApplies.push("exceptDatetime");
 
     // Area: bbox as bbox; a polygon as intersects (POST), else its bbox plus an exact client-side test.
     if (request.area) {
@@ -694,6 +795,7 @@ export function codeOf(http: HttpRequestSpec, secretHeaders: string[] = []): { c
  * @param parts.area Test the item's footprint against `request.area`.
  * @param parts.datetime Test the item's time against `request.datetime`.
  * @param parts.predicates Test `request.where` and `request.filter`.
+ * @param parts.except Test `request.exceptDatetime` (exactly, see {@link exceptFilter}).
  * @returns `true` when the item passes every test that was run.
  * @throws `Error` when a predicate uses a CQL2 operator {@link evaluateCql2} cannot evaluate.
  * @example
@@ -705,8 +807,8 @@ export function codeOf(http: HttpRequestSpec, secretHeaders: string[] = []): { c
  *
  * @category Search
  */
-export function itemMatches(item: StacItemJson, request: StacSearchRequest, parts: { area?: boolean; datetime?: boolean; predicates?: boolean } = {}): boolean {
-    const {area = true, datetime = true, predicates = true} = parts;
+export function itemMatches(item: StacItemJson, request: StacSearchRequest, parts: { area?: boolean; datetime?: boolean; predicates?: boolean; except?: boolean } = {}): boolean {
+    const {area = true, datetime = true, predicates = true, except = true} = parts;
     if (request.collections?.length && item.collection && !request.collections.includes(item.collection)) return false;
     if (request.ids?.length && !request.ids.includes(item.id)) return false;
     if (datetime) {
@@ -718,9 +820,10 @@ export function itemMatches(item: StacItemJson, request: StacSearchRequest, part
             if (Number.isNaN(s) || s > range[1] || (Number.isNaN(e) ? s : e) < range[0]) return false;
         }
     }
+    if (except && !outsidePeriods(item, request.exceptDatetime)) return false;
     if (area && request.area && !intersectsArea(item, request.area)) return false;
     if (predicates) {
-        const expr = requestFilter(request);
+        const expr = requestFilter(request, true, false);
         if (expr !== undefined && !evaluateCql2(expr, item)) return false;
     }
     return true;

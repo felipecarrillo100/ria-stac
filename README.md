@@ -38,7 +38,7 @@ const found = await client.select({
 ```
 
 - **Collections** are filtered on the server when it declares STAC Collection Search (map view and period), then
-  every test runs again in the client (formats, text, regional), so every server gives the same answer.
+  every test runs again in the client (media types, text, regional), so every server gives the same answer.
 - **Search** uses CQL2 on the server when the server declares it, the Query extension otherwise, and tests the rest
   in the client (`ogc-cql2`). `search().plan` says what ran where.
 - **Static catalogs** are crawled through their links; an area search skips children whose extent misses the area
