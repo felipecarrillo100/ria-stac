@@ -70,9 +70,12 @@ QGIS, Earthdata Search and EarthExplorer. The pattern numbers below refer to its
   collections, with how many collections offer each.
   - A collection's formats come from its `item_assets` (no request), else from one of its items, read when its card
     comes into view (at most 4 at once). "Check the other n" reads the rest, one request each.
-  - Only a collection known not to match is hidden: its `item_assets` have none of the chosen formats. A collection
-    whose item read has none of them ("not in the item read"), or whose formats are not known yet, stays, dimmed,
-    after the matches. A sample shows which formats exist, not which do not.
+  - The list shows the matches. A collection known not to match (its `item_assets` have none of the chosen formats)
+    is left out. One that might match (its item read has none of them, or it is not read yet) is behind a line
+    "n more might have …: Show them"; shown, it follows the matches, dimmed. A sample shows which formats exist,
+    not which do not, so these are never called non-matching.
+  - The map draws the extents of exactly the collections listed (text search and formats included), the unsure
+    ones faint.
   - The formats ticked here are carried into Search, where the chosen collection offers them.
 - **A summary line under them:** "381 of 428 collections · server filtered by area and period, then here", in the
   words of `ServerCollectionSearch` (pattern 8).
@@ -115,7 +118,7 @@ The form is built from what the server and the collection support (patterns 1, 2
 - **Formats:** a searchable multi-select (Autocomplete with checkboxes; the chosen ones as chips), because a
   collection can offer many formats.
   - Every format offered is listed, grouped by kind: raster (COG, GeoTIFF, JPEG 2000, NetCDF/HDF, Zarr, GRIB),
-    vector (GeoJSON, GeoParquet, GeoPackage, Shapefile, KML, INTERLIS), point clouds and 3D, documents and
+    vector (GeoJSON, Parquet, GeoPackage, Shapefile, KML, INTERLIS), point clouds and 3D, documents and
     metadata (XML, JSON, PDF, HTML, CSV), and archives (anything zipped).
   - Each format shows how many assets have it, and its media types in a tooltip.
   - None is selected at first; selecting some keeps only items with one of them.

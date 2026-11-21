@@ -6,6 +6,7 @@ import {itemBbox} from "./util.js";
 import {StacMap} from "./map/StacMap.js";
 import {areaOf, DISPLAY_PAGE, explorer, shownItems, useExplorer} from "./state/explorer.js";
 import {palette} from "./theme.js";
+import {useBrowseList} from "./state/browseList.js";
 
 /** The map, kept in step with the explorer: extents, footprints, hover and selection both ways, the area. */
 export function MapPanel({onMap}: { onMap: (m: StacMap) => void }) {
@@ -36,8 +37,13 @@ export function MapPanel({onMap}: { onMap: (m: StacMap) => void }) {
     }, []);
 
     // Collection extents while browsing, item footprints after a search.
-    useEffect(() => { ref.current?.setExtents(s.step === "collections" || s.step === "catalog" ? s.collections.filter((c) => c.bbox).map((c) => ({id: c.id, title: c.title ?? c.id, bbox: c.bbox!})) : []); },
-        [s.collections, s.step]);
+    // The extents of the collections Browse lists (text search and format filter included), unsure ones faint.
+    const browse = useBrowseList();
+    useEffect(() => {
+        const unsure = new Set(browse.unsure.map((c) => c.id));
+        ref.current?.setExtents(s.step === "collections" || s.step === "catalog"
+            ? browse.shown.filter((c) => c.bbox).map((c) => ({id: c.id, title: c.title ?? c.id, bbox: c.bbox!, faint: unsure.has(c.id)})) : []);
+    }, [browse.shown, browse.unsure, s.step]);
     // The footprints of the display page shown, as in the list.
     const shown = shownItems(s);
     useEffect(() => { ref.current?.setItems(shown); }, [s.items, s.view]);
@@ -64,6 +70,8 @@ export function MapPanel({onMap}: { onMap: (m: StacMap) => void }) {
         if (s.drawing) m.drawBox((b) => explorer.setBbox(b));
         else m.cancelDraw();
     }, [s.drawing]);
+    // A place asked for from a list (a collection's extent in Browse).
+    useEffect(() => { if (s.zoom) ref.current?.fit(s.zoom.bbox); }, [s.zoom]);
     // A whole-world search moves the map to what it found (the user may not know where the data is).
     useEffect(() => {
         if (s.pages.length === 1 && s.form.area === "world" && s.items.length) {

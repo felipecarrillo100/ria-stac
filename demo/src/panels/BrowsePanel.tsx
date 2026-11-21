@@ -1,16 +1,18 @@
-import {useEffect, useMemo, useRef} from "react";
+import {useEffect, useRef} from "react";
 import {Alert, Box, Button, Card, CardActionArea, Chip, FormControlLabel, IconButton, InputAdornment, LinearProgress, Link, MenuItem, Stack, Switch, TextField, Tooltip, Typography} from "@mui/material";
 import SearchIcon from "@mui/icons-material/Search";
 import RefreshIcon from "@mui/icons-material/Refresh";
-import {isGlobalBbox, mediaTypeMatch, type CollectionMediaTypes, type CollectionSummary, type MediaTypeMatch} from "ria-stac";
+import {isGlobalBbox, type CollectionMediaTypes, type CollectionSummary, type MediaTypeMatch} from "ria-stac";
 import PublicIcon from "@mui/icons-material/Public";
+import ZoomInMapIcon from "@mui/icons-material/ZoomInMap";
 import {explorer, useExplorer, type CollectionSort} from "../state/explorer.js";
+import {useBrowseList} from "../state/browseList.js";
 import {explainError, shortDate} from "../util.js";
 import {AreaChooser} from "./AreaChooser.js";
 import {TimeRangePicker} from "../components/TimeRangePicker.js";
 import {domainOf, fromValue, toValue, usePeriodMode} from "../components/periodValue.js";
 import {FormatPicker} from "./FormatPicker.js";
-import {formatOf, groupFormats, mediaTypesOf} from "../formats.js";
+import {formatOf} from "../formats.js";
 
 /** The formats of a collection, as far as known: from item_assets (declared) or from an item read (sampled). */
 function formatsOfKnown(known: CollectionSummary | CollectionMediaTypes | null): { formats: string[]; declared: boolean; noItems: boolean } | null {
@@ -37,27 +39,6 @@ function CardFormats({c, verdict}: { c: CollectionSummary; verdict: MediaTypeMat
             {note && <Chip label={note} size="small" color="warning" variant="outlined" sx={{height: 20, fontSize: 11}}/>}
         </Box>
     );
-}
-
-/** The list in the order asked: names by title (else id), dates by the declared period (ongoing counts as today). */
-function sorted(list: CollectionSummary[], sort: CollectionSort): CollectionSummary[] {
-    if (sort === "server") return list;
-    const name = (c: CollectionSummary) => (c.title ?? c.id).toLowerCase();
-    const end = (c: CollectionSummary) => (c.interval[1] ? Date.parse(c.interval[1]) : Date.now());
-    const start = (c: CollectionSummary) => (c.interval[0] ? Date.parse(c.interval[0]) : -Infinity);
-    const by: Record<Exclude<CollectionSort, "server">, (a: CollectionSummary, b: CollectionSummary) => number> = {
-        "name-asc": (a, b) => name(a).localeCompare(name(b)),
-        "name-desc": (a, b) => name(b).localeCompare(name(a)),
-        newest: (a, b) => end(b) - end(a) || name(a).localeCompare(name(b)),
-        oldest: (a, b) => start(a) - start(b) || name(a).localeCompare(name(b)),
-    };
-    return [...list].sort(by[sort]);
-}
-
-function matches(c: CollectionSummary, text: string): boolean {
-    if (!text) return true;
-    const t = text.toLowerCase();
-    return [c.id, c.title, c.description, ...(c.keywords ?? [])].some((v) => v?.toLowerCase().includes(t));
 }
 
 /** The period of a collection as a small bar over 1970..today, for comparing at a glance. */
@@ -87,7 +68,7 @@ function CollectionCard({c, verdict}: { c: CollectionSummary; verdict: MediaType
         return () => seen.disconnect();
     }, [c.id, c.mediaTypeSource]);
     return (
-        <Card ref={ref} variant="outlined" sx={{opacity: verdict && verdict !== "match" ? 0.6 : 1, borderColor: active ? "primary.main" : s.hoveredCollection === c.id ? "warning.main" : "divider", bgcolor: "transparent"}}
+        <Card ref={ref} variant="outlined" sx={{opacity: verdict && verdict !== "match" ? 0.6 : 1, borderColor: active ? "primary.main" : s.hoveredCollection === c.id ? "warning.main" : "divider", bgcolor: "transparent", position: "relative"}}
             onMouseEnter={() => explorer.hoverCollection(c.id)} onMouseLeave={() => explorer.hoverCollection(null)}>
             <CardActionArea sx={{p: 1.25}} onClick={() => void explorer.chooseCollection(c.id)}>
                 <Box sx={{display: "flex", alignItems: "flex-start", gap: 1}}>
@@ -109,6 +90,15 @@ function CollectionCard({c, verdict}: { c: CollectionSummary; verdict: MediaType
                     {c.keywords.slice(0, 5).map((k) => <Chip key={k} label={k} variant="outlined" sx={{height: 20, fontSize: 11}}/>)}
                 </Box>}
             </CardActionArea>
+            {/* Where it is, without choosing it: outside the card's own button. */}
+            {c.bbox && (
+                <Tooltip title={isGlobalBbox(c.bbox) ? "Show the world (its extent is global)" : "Show where it is on the map"}>
+                    <IconButton size="small" aria-label={`Show ${c.title ?? c.id} on the map`} onClick={() => explorer.zoomTo(c.bbox!)}
+                        sx={{position: "absolute", bottom: 6, right: 6, bgcolor: "background.paper", "&:hover": {bgcolor: "action.hover"}}}>
+                        <ZoomInMapIcon fontSize="small"/>
+                    </IconButton>
+                </Tooltip>
+            )}
         </Card>
     );
 }
@@ -116,31 +106,8 @@ function CollectionCard({c, verdict}: { c: CollectionSummary; verdict: MediaType
 export function BrowsePanel() {
     const s = useExplorer();
     const f = s.collectionFilters;
-    const listed = useMemo(() => sorted(s.collections.filter((c) => matches(c, f.text)), f.sort), [s.collections, f.text, f.sort]);
-    // Formats: what each listed collection is known to have (item_assets, else the item read).
-    const known = useMemo(() => new Map(s.collections.map((c) => [c.id, explorer.knownMediaTypes(c)])), [s.collections, s.sampled]);
-    const options = useMemo(() => {
-        const perFormat = new Map<string, number>();
-        const entries: { mediaType: string; count: number }[] = [];
-        for (const k of known.values()) {
-            if (!k) continue;
-            const types = "mediaTypeSource" in k ? k.mediaTypes : k.mediaTypes.map((t) => t.mediaType);
-            for (const t of types) entries.push({mediaType: t, count: 0});
-            for (const fmt of new Set(types.map(formatOf))) perFormat.set(fmt, (perFormat.get(fmt) ?? 0) + 1);
-        }
-        // Counted per collection (a collection with two GeoTIFF spellings counts once).
-        return groupFormats(entries).map((o) => ({...o, count: perFormat.get(o.format) ?? 0}));
-    }, [known]);
-    const wanted = useMemo(() => (f.formats.length ? mediaTypesOf(f.formats, explorer.seenMediaTypes()) : []), [f.formats, known]);
-    const verdicts = useMemo(() => new Map(listed.map((c) => [c.id, wanted.length ? mediaTypeMatch(known.get(c.id), wanted) : null])), [listed, known, wanted]);
-    // Only a known no-match is hidden; the unsure ones follow the matches, dimmed.
-    const shown = useMemo(() => {
-        if (!wanted.length) return listed;
-        const kept = listed.filter((c) => verdicts.get(c.id) !== "no-match");
-        return [...kept.filter((c) => verdicts.get(c.id) === "match"), ...kept.filter((c) => verdicts.get(c.id) !== "match")];
-    }, [listed, verdicts, wanted]);
-    const tally = {match: 0, unsure: 0, hidden: 0};
-    for (const v of verdicts.values()) if (v) { if (v === "match") tally.match++; else if (v === "no-match") tally.hidden++; else tally.unsure++; }
+    const {shown, unsure, showUnsure, verdicts, tally, options} = useBrowseList();
+    const matched = showUnsure ? shown.slice(0, shown.length - unsure.length) : shown;
     const declared = s.collections.filter((c) => c.mediaTypeSource === "item_assets").length;
     const sampledOk = s.collections.filter((c) => c.mediaTypeSource === "none" && typeof s.sampled[c.id] === "object").length;
     const unread = s.collections.filter((c) => c.mediaTypeSource === "none" && !s.sampled[c.id]).map((c) => c.id);
@@ -175,7 +142,7 @@ export function BrowsePanel() {
                 <strong>{shown.length}</strong> of {s.allCollections} collections
                 {step && !step.error && ` · the server kept ${step.count} (${step.sent.join(" and ")}), then the filters ran here`}
                 {step?.error && " · the server could not filter: all filtered here"}
-                {f.formats.length > 0 && ` · formats: ${tally.match} match, ${tally.unsure} not sure, ${tally.hidden} hidden`}
+                {f.formats.length > 0 && ` · ${tally.unsure} not sure (${showUnsure ? "shown, dimmed" : "hidden"}) · ${tally.hidden} without ${f.formats.join(" or ")}`}
                 {s.client.capabilities.staticCatalog && " · static catalog: crawled"}
                 {s.collectionsAt && ` · read ${new Date(s.collectionsAt).toLocaleTimeString()}`}
             </Typography>
@@ -183,7 +150,7 @@ export function BrowsePanel() {
                 <span><IconButton size="small" aria-label="Reload collections" disabled={s.collectionsLoading} onClick={() => void explorer.reloadCollections()}><RefreshIcon fontSize="small"/></IconButton></span>
             </Tooltip>
             </Box>
-            {!shown.length && !s.collectionsLoading && (
+            {!shown.length && !unsure.length && !s.collectionsLoading && (
                 <Alert severity="info" action={<Box>
                     {f.area !== "world" && <Button color="inherit" onClick={() => explorer.setCollectionFilters({area: "world"})}>The world</Button>}
                     {(f.from || f.to || f.except.length > 0) && <Button color="inherit" onClick={() => explorer.setCollectionFilters({from: "", to: "", except: []})}>Any period</Button>}
@@ -207,7 +174,19 @@ export function BrowsePanel() {
             </Stack>
         </Stack>
         <Box sx={{flex: 1, overflow: "auto", minHeight: 0, p: 2, pt: 1.5}}>
-            <Stack spacing={1}>{shown.slice(0, 300).map((c) => <CollectionCard key={c.id} c={c} verdict={verdicts.get(c.id) ?? null}/>)}</Stack>
+            <Stack spacing={1}>
+                {matched.slice(0, 300).map((c) => <CollectionCard key={c.id} c={c} verdict={verdicts.get(c.id) ?? null}/>)}
+                {unsure.length > 0 && (
+                    <Box sx={{border: 1, borderStyle: "dashed", borderColor: "divider", borderRadius: 1, p: 1.25}}>
+                        <Typography variant="body2">{unsure.length} more might have {f.formats.join(" or ")}</Typography>
+                        <Typography variant="caption" color="text.secondary" component="div">
+                            Not seen in the one item read, or not read yet: their other items may differ.{" "}
+                            <Link component="button" variant="caption" onClick={() => explorer.setCollectionFilters({showUnsure: !showUnsure})}>{showUnsure ? "Hide them" : "Show them"}</Link>
+                        </Typography>
+                    </Box>
+                )}
+                {showUnsure && unsure.slice(0, 300).map((c) => <CollectionCard key={c.id} c={c} verdict={verdicts.get(c.id) ?? null}/>)}
+            </Stack>
             {shown.length > 300 && <Typography variant="caption" color="text.secondary" component="div" sx={{mt: 1}}>Showing 300: narrow the list with the text search.</Typography>}
         </Box>
         </Box>

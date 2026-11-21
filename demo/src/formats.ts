@@ -8,7 +8,7 @@ import {normaliseMediaType} from "ria-stac";
 /** Media type patterns to format names, first match wins (tested on the media type before any `+zip`). */
 const NAMES: [RegExp, string][] = [
     [/interlis/i, "INTERLIS"], [/ms-?access/i, "MS Access"], [/geopackage/i, "GeoPackage"], [/shapefile|esri-shape|vnd\.shp/i, "Shapefile"],
-    [/flatgeobuf/i, "FlatGeobuf"], [/geo\+json/i, "GeoJSON"], [/parquet/i, "GeoParquet"], [/x-ndjson/i, "NDJSON"],
+    [/flatgeobuf/i, "FlatGeobuf"], [/geo\+json/i, "GeoJSON"], [/geoparquet/i, "GeoParquet"], [/parquet/i, "Parquet"], [/x-ndjson/i, "NDJSON"],
     [/google-earth/i, "KML"], [/gml/i, "GML"], [/json/i, "JSON"], [/csv/i, "CSV"], [/xml/i, "XML"], [/jp2|jpeg2000/i, "JPEG 2000"],
     [/jpeg/i, "JPEG"], [/png/i, "PNG"], [/webp/i, "WEBP"], [/pdf/i, "PDF"], [/ascii-xyz/i, "XYZ"], [/netcdf|x-hdf/i, "NetCDF/HDF"],
     [/zarr/i, "Zarr"], [/grib/i, "GRIB"], [/copc/i, "COPC"], [/las/i, "Point cloud"], [/dxf|dwg/i, "CAD"], [/gltf|3d-tiles/i, "3D"],
@@ -41,6 +41,7 @@ export function formatNote(format: string): string | undefined {
     if (format === "COG") return "Cloud Optimized GeoTIFF, as declared by the catalog.";
     if (format === "GeoTIFF") return "COG not declared: it may or may not be cloud-optimized. Tick COG too to take both.";
     if (/zipped|^ZIP$/.test(format)) return "A download: it has to be fetched whole and unpacked.";
+    if (format === "Parquet") return "May be GeoParquet (with geometries) or a plain table: the media type does not tell.";
     return undefined;
 }
 
@@ -50,7 +51,7 @@ const KNOWN: Record<string, string[]> = {
     "GeoTIFF": ["image/tiff; application=geotiff", "image/tiff", "image/geotiff"],
     "JPEG 2000": ["image/jp2"], "PNG": ["image/png"], "JPEG": ["image/jpeg"],
     "NetCDF/HDF": ["application/x-netcdf", "application/netcdf", "application/x-hdf5", "application/x-hdf"],
-    "Zarr": ["application/vnd+zarr", "application/vnd.zarr"], "GeoParquet": ["application/vnd.apache.parquet", "application/x-parquet"],
+    "Zarr": ["application/vnd+zarr", "application/vnd.zarr"], "Parquet": ["application/vnd.apache.parquet", "application/x-parquet"],
     "GeoJSON": ["application/geo+json"], "GeoPackage": ["application/geopackage+sqlite3"], "ZIP": ["application/zip"],
 };
 
@@ -58,7 +59,7 @@ const KNOWN: Record<string, string[]> = {
 export function kindOf(format: string): string {
     if (/zipped|^ZIP$/.test(format)) return "Archives";
     if (/COG|GeoTIFF|JPEG 2000|NetCDF|Zarr|GRIB|^TIFF|HDF/i.test(format)) return "Raster";
-    if (/GeoJSON|GeoParquet|GeoPackage|Shapefile|KML|INTERLIS|FlatGeobuf|MS Access|GML/i.test(format)) return "Vector";
+    if (/GeoJSON|Parquet|GeoPackage|Shapefile|KML|INTERLIS|FlatGeobuf|MS Access|GML/i.test(format)) return "Vector";
     if (/Point cloud|3D|COPC|LAS/i.test(format)) return "Point clouds and 3D";
     if (/JPEG|PNG|WEBP|GIF/i.test(format)) return "Images";
     return "Documents and other";

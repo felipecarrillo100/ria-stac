@@ -27,8 +27,8 @@ const ESRI_IMAGERY = "https://server.arcgisonline.com/ArcGIS/rest/services/World
 
 export interface Palette { accent: string; hover: string; extent: string; area: string }
 
-/** A collection extent to draw. */
-export interface Extent { id: string; title: string; bbox: Bbox }
+/** A collection extent to draw; `faint` for collections listed as unsure (they might not have what was asked). */
+export interface Extent { id: string; title: string; bbox: Bbox; faint?: boolean }
 
 /** A vector layer of keyed features with hover and selection, drawn by a style function. */
 class KeyedLayer {
@@ -72,6 +72,8 @@ export class StacMap {
     readonly map: WebGLMap;
     private readonly toLonLat;
     private readonly extents: KeyedLayer;
+    /** Extents drawn faint (unsure collections). */
+    private faint = new Set<string>();
     private readonly footprints: KeyedLayer;
     private readonly area: KeyedLayer;
     private readonly handles: Handle[] = [];
@@ -100,8 +102,9 @@ export class StacMap {
         });
         this.map.layerTree.addChild(new RasterTileSetLayer(basemap, {label: "Esri World Imagery", layerType: LayerType.BASE}), "bottom");
         this.area = new KeyedLayer(this.map, "Search area", () => ({stroke: palette.area, fill: "rgba(0,0,0,0)", width: 2}));
-        this.extents = new KeyedLayer(this.map, "Collection extents", (_k, s) => ({
-            stroke: s.hot ? palette.hover : palette.extent, width: s.hot ? 2.5 : 1, fill: s.hot ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0)",
+        this.extents = new KeyedLayer(this.map, "Collection extents", (k, s) => ({
+            stroke: s.hot ? palette.hover : this.faint.has(k) ? "rgba(148,163,184,0.45)" : palette.extent, width: s.hot ? 2.5 : 1,
+            fill: s.hot ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0)",
         }));
         // Items: chosen in the accent colour, the focused one (its details shown) thicker, hover in amber.
         this.footprints = new KeyedLayer(this.map, "Item footprints", (_k, s) => ({
@@ -161,6 +164,7 @@ export class StacMap {
 
     /** Draws collection extents (the overall bbox of each). */
     setExtents(extents: Extent[]) {
+        this.faint = new Set(extents.filter((e) => e.faint).map((e) => e.id));
         this.extents.set(extents.filter((e) => e.bbox[2] - e.bbox[0] < 359).map((e) => ({key: e.id, shape: this.boxShape(e.bbox), properties: {title: e.title}})));
     }
 

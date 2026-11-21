@@ -19,7 +19,11 @@ export type AreaMode = "world" | "view" | "bbox";
 export type CollectionSort = "server" | "name-asc" | "name-desc" | "newest" | "oldest";
 /** A left-out period: RFC 3339 UTC, null for an open end. */
 export interface ExceptSpan { from: string | null; to: string | null }
-export interface CollectionFilters { area: AreaMode; regional: boolean; from: string; to: string; except: ExceptSpan[]; text: string; sort: CollectionSort; formats: string[] }
+export interface CollectionFilters {
+    area: AreaMode; regional: boolean; from: string; to: string; except: ExceptSpan[]; text: string; sort: CollectionSort; formats: string[];
+    /** With a format filter: also show the collections that might have the formats (not seen, not read yet). */
+    showUnsure: boolean;
+}
 export interface SearchForm {
     area: AreaMode;
     from: string;
@@ -71,6 +75,8 @@ export interface ExplorerState {
     reveal: { key: string; n: number } | null;
     hoveredItem: string | null;
     hoveredCollection: string | null;
+    /** A place the map should show (a collection's extent from Browse), with a counter so the same place can be asked again. */
+    zoom: { bbox: Bbox; n: number } | null;
     requests: RiaStacRequest[];
     viewBbox: Bbox | null;
     /** The bounding box of the "bbox" area mode (shared by Browse and Search). */
@@ -101,12 +107,12 @@ export interface ExplorerState {
 const initial: ExplorerState = {
     step: "catalog", url: "", connecting: false, error: null, client: null,
     collections: [], allCollections: 0, collectionsLoading: false, serverStep: null,
-    collectionFilters: {area: "view", regional: false, from: "", to: "", except: [], text: "", sort: "server", formats: []},
+    collectionFilters: {area: "view", regional: false, from: "", to: "", except: [], text: "", sort: "server", formats: [], showUnsure: false},
     collection: null, collectionLoading: false, mediaTypes: null, sampled: {},
     form: {area: "view", from: "", to: "", except: [], maxCloud: null, formats: [], cql2: "", sort: "", maxItems: 5000},
     plan: null, cql2Error: null,
     items: [], pages: [], searching: false, searchError: null, hasMore: false,
-    selectedItem: null, chosen: {}, reveal: null, hoveredItem: null, hoveredCollection: null, requests: [], viewBbox: null,
+    selectedItem: null, chosen: {}, reveal: null, hoveredItem: null, hoveredCollection: null, zoom: null, requests: [], viewBbox: null,
     bbox: null, drawing: false, details: null, requestsOpen: false,
     autoUpdate: true, dirty: false, fetchedAt: null, collectionsAt: null, dataRange: null, dataRangeLoading: false, view: 0,
     sourceExtent: null, collectionExtent: null,
@@ -184,6 +190,8 @@ class Explorer {
     setDrawing(drawing: boolean) { this.set({drawing}); }
     hoverItem(key: string | null) { this.set({hoveredItem: key}); }
     hoverCollection(id: string | null) { this.set({hoveredCollection: id}); }
+    /** Moves the map to a box, without choosing anything (a look at where a collection is). */
+    zoomTo(bbox: Bbox) { this.set({zoom: {bbox, n: (this.state.zoom?.n ?? 0) + 1}}); }
     /** Shows an item's details; `reveal` also brings its row into view (opening its display page). */
     selectItem(key: string | null, reveal = false) {
         const update: Partial<ExplorerState> = {selectedItem: key, details: key ? "item" : this.state.details === "item" ? null : this.state.details};
@@ -309,7 +317,7 @@ class Explorer {
     setCollectionFilters(update: Partial<CollectionFilters>) {
         this.set({collectionFilters: {...this.state.collectionFilters, ...update}});
         // Text, sort and formats run on the list already read: no request (formats: only the items Browse samples).
-        if (Object.keys(update).some((k) => k !== "text" && k !== "sort" && k !== "formats")) void this.fillCollections();
+        if (Object.keys(update).some((k) => !["text", "sort", "formats", "showUnsure"].includes(k))) void this.fillCollections();
     }
 
     /** The same collection filters again, read fresh from the server (it may have added or changed collections). */
