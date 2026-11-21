@@ -103,7 +103,7 @@ export function SearchPanel() {
             </Box>
             <Box>
                 <Typography variant="overline" color="text.secondary">Data</Typography>
-                <FormatPicker options={groupFormats((s.mediaTypes?.mediaTypes ?? []).map((t) => ({mediaType: t.mediaType, count: t.keys.length})))} unit="asset"
+                <FormatPicker options={groupFormats((s.mediaTypes?.mediaTypes ?? []).map((t) => ({mediaType: t.mediaType, count: t.keys.length})))} unit="asset" scope="in this collection"
                     value={form.formats} onChange={(formats) => explorer.setForm({formats})} loading={!s.mediaTypes} caption={<>
                         {!s.mediaTypes ? "Reading what the collection offers…"
                             : s.mediaTypes.source === "item_assets" ? "From the collection's item_assets (complete)."

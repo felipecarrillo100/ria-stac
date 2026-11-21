@@ -68,7 +68,9 @@ function CollectionCard({c, verdict}: { c: CollectionSummary; verdict: MediaType
         return () => seen.disconnect();
     }, [c.id, c.mediaTypeSource]);
     return (
-        <Card ref={ref} variant="outlined" sx={{opacity: verdict && verdict !== "match" ? 0.6 : 1, borderColor: active ? "primary.main" : s.hoveredCollection === c.id ? "warning.main" : "divider", bgcolor: "transparent", position: "relative"}}
+        <Card ref={ref} variant="outlined" sx={{opacity: verdict && verdict !== "match" ? 0.6 : 1, borderWidth: 1.5, bgcolor: "transparent", position: "relative",
+            // A border that stands out from the panel; amber on hover, sky for the chosen collection.
+            borderColor: active ? "primary.main" : s.hoveredCollection === c.id ? "warning.main" : "rgba(148,163,184,0.45)"}}
             onMouseEnter={() => explorer.hoverCollection(c.id)} onMouseLeave={() => explorer.hoverCollection(null)}>
             <CardActionArea sx={{p: 1.25}} onClick={() => void explorer.chooseCollection(c.id)}>
                 <Box sx={{display: "flex", alignItems: "flex-start", gap: 1}}>
@@ -129,7 +131,7 @@ export function BrowsePanel() {
             <AreaChooser value={f.area} onChange={(area) => explorer.setCollectionFilters({area})} worldNote="Every collection, wherever its data is."/>
             <TimeRangePicker value={toValue(f)} onChange={(v) => explorer.setCollectionFilters(fromValue(v))} labels={["Data from", "Data to"]}
                 domain={domainOf(s.sourceExtent)} mode={mode} onModeChange={setMode}/>
-            <FormatPicker options={options} unit="collection" value={f.formats} onChange={(formats) => explorer.setCollectionFilters({formats})} caption={<>
+            <FormatPicker options={options} unit="collection" scope={`in ${s.collections.length} collection${s.collections.length === 1 ? "" : "s"}`} value={f.formats} onChange={(formats) => explorer.setCollectionFilters({formats})} caption={<>
                 Formats known for {declared + sampledOk} of {s.collections.length} collections ({declared} declared, {sampledOk} from one item{reading ? `, ${reading} being read` : ""}).
                 {unread.length > 0 && <>{" "}<Link component="button" variant="caption" onClick={() => explorer.sampleCollections(unread)}>Check the other {unread.length}</Link> (one request each)</>}
                 {f.formats.length > 0 && " Only collections known to lack them are hidden."}
